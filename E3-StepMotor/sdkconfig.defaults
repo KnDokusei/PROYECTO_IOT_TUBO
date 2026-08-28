@@ -3,3 +3,7 @@ CONFIG_IDF_TARGET="esp32"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Los pasos se generan desde una alarma de GPTimer, así que gpio_set_level() y
+# gpio_get_level() se llaman en contexto de ISR: tienen que estar en IRAM.
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y

@@ -1,5 +1,5 @@
 /*
- * kundt_wifi.c - see kundt_wifi.h.
+ * kundt_wifi.c - ver kundt_wifi.h.
  */
 
 #include "kundt_wifi.h"
@@ -31,20 +31,20 @@ static esp_timer_handle_t s_retry_timer;
 static void retry_timer_cb(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "reconnecting...");
+    ESP_LOGI(TAG, "reconectando...");
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "esp_wifi_connect falló: %s", esp_err_to_name(err));
     }
 }
 
-/* Exponential backoff, capped. Without the cap a long AP outage would push the
- * retry interval out indefinitely; without the backoff the log floods and the
- * radio never idles. */
+/* Espera exponencial con tope. Sin el tope, una caída larga del AP alargaría el
+ * intervalo indefinidamente; sin la espera creciente, el log se inunda y la radio
+ * nunca descansa. */
 static void schedule_retry(void)
 {
     esp_timer_stop(s_retry_timer);
-    ESP_LOGI(TAG, "retrying in %lu ms", (unsigned long)s_retry_delay_ms);
+    ESP_LOGI(TAG, "reintento en %lu ms", (unsigned long)s_retry_delay_ms);
     esp_timer_start_once(s_retry_timer, (uint64_t)s_retry_delay_ms * 1000);
 
     s_retry_delay_ms *= 2;
@@ -70,7 +70,7 @@ static void wifi_event_handler(void            *arg,
         s_disconnects++;
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
         strcpy(s_ip, "0.0.0.0");
-        ESP_LOGW(TAG, "disconnected (reason %d), total %lu",
+        ESP_LOGW(TAG, "desconectado (motivo %d), total %lu",
                  ev ? ev->reason : -1, (unsigned long)s_disconnects);
         schedule_retry();
         return;
@@ -79,12 +79,12 @@ static void wifi_event_handler(void            *arg,
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
-        /* A successful association resets the backoff, so the next outage
-         * starts retrying quickly again. */
+        /* Una asociación exitosa reinicia la espera, para que la próxima caída
+         * vuelva a reintentar rápido. */
         s_retry_delay_ms = KUNDT_WIFI_RETRY_MIN_MS;
         esp_timer_stop(s_retry_timer);
         xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "connected, ip=%s", s_ip);
+        ESP_LOGI(TAG, "conectado, ip=%s", s_ip);
         return;
     }
 }
@@ -134,19 +134,19 @@ esp_err_t kundt_wifi_connect(const char *ssid, const char *password)
         return ESP_ERR_INVALID_STATE;
     }
     if (ssid == NULL || password == NULL || ssid[0] == '\0') {
-        ESP_LOGE(TAG, "SSID not configured -- provision it over the console first");
+        ESP_LOGE(TAG, "SSID sin configurar: hay que provisionarlo primero");
         return ESP_ERR_INVALID_ARG;
     }
 
     wifi_config_t cfg = { 0 };
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
-    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  /* Accept open and secured APs. */
+    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  /* Acepta APs abiertos y cifrados. */
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "connecting to \"%s\"", ssid);
+    ESP_LOGI(TAG, "conectando a \"%s\"", ssid);
     return ESP_OK;
 }
 

@@ -1,5 +1,5 @@
 /*
- * servo.c - see servo.h.
+ * servo.c - ver servo.h.
  */
 
 #include "servo.h"
@@ -13,7 +13,7 @@ static const char *TAG = "servo";
 #define SERVO_LEDC_CHANNEL LEDC_CHANNEL_0
 #define SERVO_LEDC_MODE    LEDC_LOW_SPEED_MODE
 
-static int  s_angle = -1;   /* -1 == never written */
+static int  s_angle = -1;   /* -1 == nunca se ha escrito */
 static bool s_ready;
 
 esp_err_t servo_init(const servo_config_t *cfg)
@@ -52,7 +52,7 @@ esp_err_t servo_init(const servo_config_t *cfg)
     s_ready = true;
     s_angle = servo_clamp_angle(cfg->initial_angle);
 
-    ESP_LOGI(TAG, "ready on GPIO%d at %d deg (%lu us)",
+    ESP_LOGI(TAG, "listo en GPIO%d a %d grados (%lu us)",
              cfg->gpio, s_angle, (unsigned long)servo_angle_to_pulse_us(s_angle));
     return ESP_OK;
 }
@@ -65,10 +65,10 @@ esp_err_t servo_set_angle(int angle_deg)
 
     const int angle = servo_clamp_angle(angle_deg);
     if (angle != angle_deg) {
-        ESP_LOGW(TAG, "angle %d out of range, clamped to %d", angle_deg, angle);
+        ESP_LOGW(TAG, "ángulo %d fuera de rango, acotado a %d", angle_deg, angle);
     }
     if (angle == s_angle) {
-        return ESP_OK;  /* Nothing to do; avoids needless servo chatter. */
+        return ESP_OK;  /* Nada que hacer; evita mover el servo sin necesidad. */
     }
 
     const uint32_t duty = servo_angle_to_duty(angle);

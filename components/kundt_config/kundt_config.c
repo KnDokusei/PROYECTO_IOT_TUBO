@@ -1,5 +1,5 @@
 /*
- * kundt_config.c - see kundt_config.h.
+ * kundt_config.c - ver kundt_config.h.
  */
 
 #include "kundt_config.h"
@@ -22,8 +22,8 @@ static const char *TAG = "kundt_config";
 static kundt_config_t s_cfg;
 static bool           s_loaded;
 
-/* Copies into a fixed buffer and always terminates. Returns false when the
- * source would not fit, so callers can reject rather than silently truncate. */
+/* Copia a un buffer fijo y siempre termina la cadena. Devuelve false si el
+ * origen no cabe, para que el llamador rechace en vez de truncar en silencio. */
 static bool copy_bounded(char *dst, size_t dst_size, const char *src)
 {
     if (src == NULL) {
@@ -75,20 +75,20 @@ esp_err_t kundt_config_init(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS partition needs erasing, reformatting");
+        ESP_LOGW(TAG, "la partición NVS necesita borrarse; reformateando");
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "nvs_flash_init falló: %s", esp_err_to_name(err));
         return err;
     }
 
     nvs_handle_t h;
     err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        /* Namespace absent: first boot. Seed from the build-time defaults. */
-        ESP_LOGI(TAG, "no stored config, seeding from Kconfig defaults");
+        /* Sin namespace: primer arranque. Se siembra con los valores de compilación. */
+        ESP_LOGI(TAG, "sin configuración guardada; sembrando desde Kconfig");
         copy_bounded(s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), CONFIG_KUNDT_DEFAULT_WIFI_SSID);
         copy_bounded(s_cfg.wifi_password, sizeof(s_cfg.wifi_password), CONFIG_KUNDT_DEFAULT_WIFI_PASSWORD);
         copy_bounded(s_cfg.server_ip, sizeof(s_cfg.server_ip), CONFIG_KUNDT_DEFAULT_SERVER_IP);
@@ -101,7 +101,7 @@ esp_err_t kundt_config_init(void)
         return ESP_OK;
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "nvs_open falló: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -142,7 +142,7 @@ esp_err_t kundt_config_set_wifi(const char *ssid, const char *password)
     }
     if (!copy_bounded(s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), ssid) ||
         !copy_bounded(s_cfg.wifi_password, sizeof(s_cfg.wifi_password), password)) {
-        ESP_LOGE(TAG, "SSID or password too long");
+        ESP_LOGE(TAG, "SSID o contraseña demasiado largos");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -156,7 +156,7 @@ esp_err_t kundt_config_set_wifi(const char *ssid, const char *password)
 esp_err_t kundt_config_set_kit(uint8_t kit)
 {
     if (kit < KUNDT_KIT_MIN || kit > KUNDT_KIT_MAX) {
-        ESP_LOGE(TAG, "kit %u outside %d..%d", kit, KUNDT_KIT_MIN, KUNDT_KIT_MAX);
+        ESP_LOGE(TAG, "kit %u fuera de %d..%d", kit, KUNDT_KIT_MIN, KUNDT_KIT_MAX);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -178,7 +178,7 @@ esp_err_t kundt_config_set_kit(uint8_t kit)
 esp_err_t kundt_config_set_server_ip(const char *ip)
 {
     if (!copy_bounded(s_cfg.server_ip, sizeof(s_cfg.server_ip), ip)) {
-        ESP_LOGE(TAG, "server IP too long");
+        ESP_LOGE(TAG, "la IP del servidor es demasiado larga");
         return ESP_ERR_INVALID_ARG;
     }
     return store_str(KEY_SERVER_IP, s_cfg.server_ip);
@@ -215,5 +215,5 @@ void kundt_config_log(void)
              s_cfg.wifi_ssid,
              s_cfg.server_ip,
              (unsigned)kundt_config_ws_port());
-    ESP_LOGI(TAG, "password: %s", s_cfg.wifi_password[0] ? "<set>" : "<empty>");
+    ESP_LOGI(TAG, "contraseña: %s", s_cfg.wifi_password[0] ? "<definida>" : "<vacía>");
 }

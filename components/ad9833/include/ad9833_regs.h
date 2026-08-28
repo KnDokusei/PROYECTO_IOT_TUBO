@@ -1,10 +1,11 @@
 /*
- * ad9833_regs.h - Register encoding for the AD9833 DDS waveform generator.
+ * ad9833_regs.h - Codificación de registros del generador DDS AD9833.
  *
- * Pure integer maths, no ESP-IDF dependency, so the frequency-word calculation
- * can be unit tested on the host. The SPI transport lives in ad9833.c.
+ * Aritmética entera pura, sin dependencias de ESP-IDF, para poder probar en el
+ * host el cálculo de la palabra de frecuencia. El transporte SPI vive en
+ * ad9833.c.
  *
- * Reference: AD9833 data sheet (Analog Devices), "Programming the AD9833".
+ * Referencia: datasheet del AD9833 (Analog Devices), "Programming the AD9833".
  */
 #pragma once
 
@@ -15,25 +16,25 @@
 extern "C" {
 #endif
 
-/* Register addresses live in the top two bits of every 16-bit word. */
+/* La dirección de registro va en los bits altos de cada palabra de 16 bits. */
 #define AD9833_REG_CONTROL 0x0000u
 #define AD9833_REG_FREQ0   0x4000u
 #define AD9833_REG_FREQ1   0x8000u
 #define AD9833_REG_PHASE0  0xC000u
 #define AD9833_REG_PHASE1  0xE000u
 
-/* Control-register bits used here. */
-#define AD9833_CTRL_B28     (1u << 13)  /* 28-bit word in two consecutive writes */
-#define AD9833_CTRL_RESET   (1u << 8)   /* Hold the phase accumulator in reset */
-#define AD9833_CTRL_OPBITEN (1u << 5)   /* Route the MSB to VOUT (square wave) */
-#define AD9833_CTRL_DIV2    (1u << 3)   /* Square wave at MCLK/2 instead of /4 */
-#define AD9833_CTRL_MODE    (1u << 1)   /* Triangle instead of sine */
+/* Bits del registro de control que se usan aquí (datasheet, tabla de control). */
+#define AD9833_CTRL_B28     (1u << 13)  /* Palabra de 28 bits en dos escrituras */
+#define AD9833_CTRL_RESET   (1u << 8)   /* Mantiene en reset el acumulador de fase */
+#define AD9833_CTRL_OPBITEN (1u << 5)   /* Saca el MSB del DAC por VOUT (cuadrada) */
+#define AD9833_CTRL_DIV2    (1u << 3)   /* Sólo con OPBITEN=1: 1 saca el MSB, 0 el MSB/2 */
+#define AD9833_CTRL_MODE    (1u << 1)   /* Triangular en vez de senoidal */
 
-/* The frequency word is 28 bits, split into two 14-bit halves. */
+/* La palabra de frecuencia es de 28 bits, partida en dos mitades de 14. */
 #define AD9833_FREQ_BITS 28
 #define AD9833_FREQ_MASK 0x3FFFu
 
-/* Crystal fitted to the common AD9833 breakout boards. */
+/* Cristal que traen las placas de desarrollo habituales del AD9833. */
 #define AD9833_DEFAULT_MCLK_HZ 25000000u
 
 typedef enum {
@@ -43,36 +44,37 @@ typedef enum {
 } ad9833_waveform_t;
 
 /**
- * @brief Frequency tuning word: FREQREG = (f_out * 2^28) / f_MCLK.
+ * @brief Palabra de sintonía: FREQREG = (f_out * 2^28) / f_MCLK.
  *
- * Rounded to nearest. Frequencies at or above Nyquist (MCLK/2) are clamped:
- * the DDS cannot synthesise them and letting the word wrap would produce an
- * alias at some unrelated frequency instead of an obvious error.
+ * Redondeada al más cercano. Las frecuencias iguales o superiores a Nyquist
+ * (MCLK/2) se acotan: el DDS no puede sintetizarlas, y dejar que la palabra
+ * desborde produciría un alias en una frecuencia cualquiera en vez de un error
+ * evidente.
  *
- * @return The 28-bit tuning word.
+ * @return La palabra de sintonía de 28 bits.
  */
 uint32_t ad9833_freq_word(uint32_t freq_hz, uint32_t mclk_hz);
 
-/** @brief Low 14 bits of a tuning word, addressed to FREQ0. */
+/** @brief Los 14 bits bajos de una palabra de sintonía, dirigidos a FREQ0. */
 static inline uint16_t ad9833_freq_lsb(uint32_t word)
 {
     return (uint16_t)(AD9833_REG_FREQ0 | (word & AD9833_FREQ_MASK));
 }
 
-/** @brief High 14 bits of a tuning word, addressed to FREQ0. */
+/** @brief Los 14 bits altos de una palabra de sintonía, dirigidos a FREQ0. */
 static inline uint16_t ad9833_freq_msb(uint32_t word)
 {
     return (uint16_t)(AD9833_REG_FREQ0 | ((word >> 14) & AD9833_FREQ_MASK));
 }
 
-/** @brief Control word for a waveform, optionally asserting RESET. */
+/** @brief Palabra de control para una forma de onda, activando RESET si se pide. */
 uint16_t ad9833_control_word(ad9833_waveform_t wave, bool reset);
 
 /**
- * @brief Frequency actually produced by a tuning word.
+ * @brief Frecuencia que realmente produce una palabra de sintonía.
  *
- * The inverse of ad9833_freq_word(). Useful to report the real output, which
- * differs slightly from the request because the word is an integer.
+ * La inversa de ad9833_freq_word(). Sirve para informar la salida real, que
+ * difiere levemente de la pedida porque la palabra es entera.
  */
 uint32_t ad9833_word_to_freq(uint32_t word, uint32_t mclk_hz);
 

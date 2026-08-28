@@ -1,11 +1,12 @@
 /*
- * ad9833.h - AD9833 DDS driver over the ESP-IDF SPI master.
+ * ad9833.h - Driver del DDS AD9833 sobre el maestro SPI de ESP-IDF.
  *
- * Replaces the Arduino MD_AD9833 library. The part is write-only over a 3-wire
- * interface (SCLK, SDATA, FSYNC): there is nothing to read back, so every call
- * here is fire-and-forget and errors can only come from the SPI layer itself.
+ * Reemplaza a la librería MD_AD9833 de Arduino. El integrado es de sólo
+ * escritura por una interfaz de tres hilos (SCLK, SDATA, FSYNC): no hay nada que
+ * leer de vuelta, así que toda llamada es a ciegas y los errores sólo pueden
+ * venir de la capa SPI.
  *
- * Wiring in the Kundt tube (module E2), per the project schematic:
+ * Cableado en el tubo de Kundt (módulo E2), según el esquemático del proyecto:
  *   FSYNC -> GPIO5,  SDATA -> GPIO23 (VSPI MOSI),  SCLK -> GPIO18 (VSPI SCK)
  */
 #pragma once
@@ -25,8 +26,8 @@ typedef struct {
     int      gpio_mosi;
     int      gpio_sclk;
     int      gpio_fsync;
-    uint32_t mclk_hz;      /* Crystal on the board; 25 MHz on usual breakouts. */
-    uint32_t clock_speed;  /* SPI clock. The part accepts up to 40 MHz. */
+    uint32_t mclk_hz;      /* Cristal de la placa; 25 MHz en las habituales. */
+    uint32_t clock_speed;  /* Reloj SPI. El integrado admite hasta 40 MHz. */
 } ad9833_config_t;
 
 #define AD9833_DEFAULT_CONFIG()                    \
@@ -42,24 +43,24 @@ typedef struct {
 
 typedef struct ad9833_dev_t *ad9833_handle_t;
 
-/** @brief Initialise the SPI bus and reset the device into a known state. */
+/** @brief Inicializa el bus SPI y deja el dispositivo en un estado conocido. */
 esp_err_t ad9833_init(const ad9833_config_t *cfg, ad9833_handle_t *out);
 
-/** @brief Release the device and free the SPI bus. */
+/** @brief Libera el dispositivo y el bus SPI. */
 esp_err_t ad9833_deinit(ad9833_handle_t dev);
 
 /**
- * @brief Set the output frequency.
+ * @brief Fija la frecuencia de salida.
  *
- * @param actual_hz Optional; receives the frequency really produced, which
- *                  differs from the request because the tuning word is integer.
+ * @param actual_hz Opcional; recibe la frecuencia realmente producida, que
+ *                  difiere de la pedida porque la palabra de sintonía es entera.
  */
 esp_err_t ad9833_set_frequency(ad9833_handle_t dev, uint32_t freq_hz, uint32_t *actual_hz);
 
-/** @brief Select the output waveform. */
+/** @brief Selecciona la forma de onda de salida. */
 esp_err_t ad9833_set_waveform(ad9833_handle_t dev, ad9833_waveform_t wave);
 
-/** @brief Frequency currently programmed, in Hz. */
+/** @brief Frecuencia programada actualmente, en Hz. */
 uint32_t ad9833_get_frequency(ad9833_handle_t dev);
 
 #ifdef __cplusplus

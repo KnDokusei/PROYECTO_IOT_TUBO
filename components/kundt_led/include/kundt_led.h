@@ -1,11 +1,11 @@
 /*
- * kundt_led.h - Status LED shared by the Kundt tube modules.
+ * kundt_led.h - LED de estado compartido por los módulos del tubo de Kundt.
  *
- * The on-board LED is the only diagnostic available once a module is mounted
- * inside the rig with no serial console attached, so the blink pattern encodes
- * what the firmware is doing rather than just proving it is alive.
+ * Una vez montado el módulo en el equipo y sin consola serie conectada, el LED
+ * de la placa es el único diagnóstico disponible. Por eso el patrón de parpadeo
+ * codifica qué está haciendo el firmware, en vez de sólo demostrar que vive.
  *
- * GPIO2 is the blue LED on the DOIT DEVKIT V1.
+ * En la DOIT DEVKIT V1, GPIO2 es el LED azul.
  */
 #pragma once
 
@@ -18,37 +18,37 @@ extern "C" {
 #define KUNDT_LED_DEFAULT_GPIO 2
 
 typedef enum {
-    KUNDT_LED_BOOT = 0,   /* Fast flicker: starting up / self-test running */
-    KUNDT_LED_NO_WIFI,    /* One slow blink every 2 s: no network */
-    KUNDT_LED_NO_SERVER,  /* Double blink: WiFi up, backend unreachable */
-    KUNDT_LED_RUNNING,    /* Steady fast blink: everything working */
-    KUNDT_LED_SELFTEST,   /* Triple blink: bench self-test build, NOT production */
+    KUNDT_LED_BOOT = 0,   /* Titileo rápido: arrancando o autoprueba en curso */
+    KUNDT_LED_NO_WIFI,    /* Un parpadeo lento cada 2 s: sin red */
+    KUNDT_LED_NO_SERVER,  /* Parpadeo doble: WiFi arriba, backend inalcanzable */
+    KUNDT_LED_RUNNING,    /* Parpadeo parejo: todo funcionando */
+    KUNDT_LED_SELFTEST,   /* Parpadeo triple: compilación de banco, NO de producción */
 } kundt_led_state_t;
 
 /**
- * @brief Start the LED task. Safe to call before anything else is up.
- * @param gpio Pin driving the LED; KUNDT_LED_DEFAULT_GPIO for the on-board one.
+ * @brief Arranca la tarea del LED. Se puede llamar antes que todo lo demás.
+ * @param gpio Pin que maneja el LED; KUNDT_LED_DEFAULT_GPIO para el de la placa.
  */
 esp_err_t kundt_led_init(int gpio);
 
-/** @brief Change the pattern. Takes effect at the end of the current cycle. */
+/** @brief Cambia el patrón. Toma efecto al terminar el ciclo en curso. */
 void kundt_led_set_state(kundt_led_state_t state);
 
-/** @brief Current pattern. */
+/** @brief Patrón actual. */
 kundt_led_state_t kundt_led_get_state(void);
 
 /**
- * @brief Mark the build as a bench self-test.
+ * @brief Marca la compilación como autoprueba de banco.
  *
- * Once latched, the LED adds a distinctive triple blink to every pattern. A
- * self-test build re-routes pins away from where the schematic puts them (the
- * E2 servo moves from GPIO21 to GPIO25), so flashing one into a real rig fails
- * silently -- the wire is simply not driven. This makes that visible from
- * across the bench without a console.
+ * Una vez activado, el LED antepone un parpadeo triple distintivo a cualquier
+ * patrón. Una compilación de autoprueba mueve pines fuera de donde los pone el
+ * esquemático (el servo de E2 pasa de GPIO21 a GPIO25), así que grabarla en un
+ * equipo real falla en silencio: el cable simplemente no se excita. Esto lo hace
+ * visible desde el otro lado del banco y sin consola.
  */
 void kundt_led_mark_selftest(void);
 
-/** @brief Human-readable name of a state, for logging. */
+/** @brief Nombre legible de un estado, para el log. */
 const char *kundt_led_state_name(kundt_led_state_t state);
 
 #ifdef __cplusplus

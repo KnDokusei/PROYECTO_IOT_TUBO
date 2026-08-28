@@ -22,6 +22,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 START = time.time()
 STATIC = False
 SWEEP = False
+EMBOLO = False
+
+# Barrido de posiciones del embolo, para la prueba de E3. Los valores van en la
+# unidad que E3 supone para "valores.embolo" (milimetros por defecto, ver el
+# hallazgo A3): 300 mm son 30 cm, dentro del riel [26, 84] cm.
+EMBOLO_PHASES = [
+    (15, 300.0),
+    (30, 500.0),
+    (45, 700.0),
+    (60, 840.0),
+    (75, 300.0),
+    (999, 500.0),
+]
+
+
+def embolo_now():
+    t = time.time() - START
+    for limit, mm in EMBOLO_PHASES:
+        if t < limit:
+            return mm
+    return EMBOLO_PHASES[-1][1]
 
 # Barrido de volumenes conocidos, para la prueba de integracion E2 -> E1:
 # cada escalon cambia el ancho de pulso del PWM que E2 saca por GPIO25, y E1
@@ -78,6 +99,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_PUT(self):
+        """Telemetria de posicion que envia E3."""
+        if "/api/kundt/equipo/" not in self.path:
+            self._send(404, "no such endpoint", "text/plain")
+            return
+
+        n = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+        try:
+            pos = json.loads(raw).get("posicion")
+        except Exception:
+            pos = None
+
+        self._send(200, json.dumps({"ok": True}))
+        t = time.time() - START
+        print(f"[{t:6.1f}s] {self.client_address[0]} PUT  posicion={pos}", flush=True)
+
     def do_GET(self):
         if "/api/kundt/equipo/" not in self.path:
             self._send(404, "no such endpoint", "text/plain")
@@ -104,10 +142,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"valores": {"frecuencia": freq, "volumen": vol}}))
             note = f"-> frecuencia={freq} volumen={vol} (fuera de rango)"
         else:
+            emb = embolo_now() if EMBOLO else 42.0
             self._send(200, json.dumps({
-                "valores": {"frecuencia": freq, "volumen": vol, "embolo": 42.0}
+                "valores": {"frecuencia": freq, "volumen": vol, "embolo": emb}
             }))
-            note = f"-> frecuencia={freq} volumen={vol}"
+            note = f"-> frecuencia={freq} volumen={vol} embolo={emb}"
 
         # flush=True: con la salida redirigida a fichero, Python usa buffering de
         # bloque y las lineas se pierden si el proceso muere antes de vaciarlo.
@@ -123,11 +162,16 @@ def main():
                     help="siempre respuesta valida, sin secuencia de fallos")
     ap.add_argument("--sweep", action="store_true",
                     help="barrido de volumenes conocidos (prueba de integracion E2->E1)")
+    ap.add_argument("--embolo", action="store_true",
+                    help="barrido de posiciones del embolo (prueba de E3)")
     args = ap.parse_args()
 
-    global STATIC, SWEEP
+    global STATIC, SWEEP, EMBOLO
     STATIC = args.static
     SWEEP  = args.sweep
+    EMBOLO = args.embolo
+    if EMBOLO:
+        STATIC = True  # sin secuencia de fallos: interesa el movimiento
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Escuchando en http://{args.host}:{args.port}/api/kundt/equipo/{{kit}}", flush=True)

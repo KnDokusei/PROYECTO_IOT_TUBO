@@ -1,16 +1,16 @@
 /*
- * E2-SineGen - Kundt tube audio generation module, ESP-IDF port.
+ * E2-SineGen - Módulo de generación de audio del tubo de Kundt, port a ESP-IDF.
  *
- * Role (per the project README): generate the signal that drives the speaker
- * at one end of the tube. The frequency comes from the backend and is
- * synthesised by an AD9833 DDS; the volume also comes from the backend and is
- * set by a servo that turns the potentiometer at the output of the audio
- * amplifier.
+ * Función (según el README del proyecto): generar la señal que excita el parlante
+ * en un extremo del tubo. La frecuencia la entrega el backend y la sintetiza un
+ * DDS AD9833; el volumen también viene del backend y lo fija un servo que gira
+ * el potenciómetro a la salida del amplificador de audio.
  *
- * Signal path: AD9833 (SPI) -> LM386 amplifier -> potentiometer (servo) -> speaker
+ * Cadena de señal: AD9833 (SPI) -> amplificador LM386 -> potenciómetro (servo)
+ *                  -> parlante.
  *
- * Ported from the Arduino sketch. Behaviour is deliberately unchanged except
- * where the original was wrong; those cases are marked with their audit ID.
+ * Portado del sketch de Arduino. El comportamiento se conserva a propósito,
+ * salvo donde el original estaba mal; esos casos se marcan con su ID de auditoría.
  */
 
 #include <stdio.h>
@@ -29,21 +29,21 @@
 
 static const char *TAG = "E2-SineGen";
 
-/* The original sketch polled every 2 s. Kept: the backend is shared with the
- * other modules and there is no reason to poll it harder. */
+/* El sketch original consultaba cada 2 s. Se mantiene: el backend es compartido
+ * con los otros módulos y no hay motivo para exigirlo más. */
 #define POLL_INTERVAL_MS 2000
 
-/* Backend port for the values API. */
+/* Puerto del backend para la API de valores. */
 #define API_PORT 5000
 
-/* Frequency the AD9833 starts at, matching the Arduino default. */
+/* Frecuencia inicial del AD9833; la misma que traía la versión Arduino. */
 #define DEFAULT_FREQ_HZ 1200
 
 /*
- * Audio band limits. The tube is a physics experiment, not an arbitrary signal
- * source: a value outside this range is a backend error, not a request. The
- * Arduino build passed anything straight through, and a failed JSON parse in
- * particular produced 0 Hz (finding A4).
+ * Límites de la banda de audio. El tubo es un experimento de física, no una
+ * fuente de señal arbitraria: un valor fuera de este rango es un error del
+ * backend, no una petición. La versión Arduino dejaba pasar cualquier cosa, y en
+ * particular un parseo JSON fallido daba 0 Hz (hallazgo A4).
  */
 #define FREQ_MIN_HZ 20
 #define FREQ_MAX_HZ 20000
@@ -68,14 +68,14 @@ static void control_task(void *arg)
     int last_freq = -1;
     uint32_t ok = 0, failed = 0;
 
-    ESP_LOGI(TAG, "control loop started (poll every %d ms)", POLL_INTERVAL_MS);
+    ESP_LOGI(TAG, "lazo de control iniciado (consulta cada %d ms)", POLL_INTERVAL_MS);
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
 
         if (!kundt_wifi_is_connected()) {
             kundt_led_set_state(KUNDT_LED_NO_WIFI);
-            continue;  /* The WiFi component retries on its own. */
+            continue;  /* El componente de WiFi reintenta por su cuenta. */
         }
 
         kundt_valores_t v;
@@ -84,13 +84,13 @@ static void control_task(void *arg)
             failed++;
             kundt_led_set_state(KUNDT_LED_NO_SERVER);
             /*
-             * Hold the last good setpoint rather than falling back to zero.
-             * In the Arduino build a bad response silently became 0 Hz and 0
-             * degrees, so a backend hiccup killed the tone and slammed the
-             * servo to one end (finding A4).
+             * Mantener la última consigna válida en vez de caer a cero. En la
+             * versión Arduino una respuesta mala se convertía en silencio en
+             * 0 Hz y 0 grados, así que un tropiezo del backend apagaba el tono y
+             * mandaba el servo contra un extremo (hallazgo A4).
              */
             if (failed % 10 == 1) {
-                ESP_LOGW(TAG, "GET failed (%s); holding last setpoint (%d Hz, %d deg)",
+                ESP_LOGW(TAG, "el GET falló (%s); se mantiene la última consigna (%d Hz, %d grados)",
                          esp_err_to_name(err), last_freq, servo_get_angle());
             }
             continue;
@@ -101,32 +101,32 @@ static void control_task(void *arg)
         if (v.has_frecuencia) {
             const int want = clamp_freq(v.frecuencia);
             if (want != v.frecuencia) {
-                ESP_LOGW(TAG, "frequency %d Hz out of range, clamped to %d Hz",
+                ESP_LOGW(TAG, "frecuencia %d Hz fuera de rango, acotada a %d Hz",
                          v.frecuencia, want);
             }
-            /* Only reprogram on change: the original rewrote the DDS every
-             * cycle even when the value was identical. */
+            /* Reprogramar sólo si cambió: el original reescribía el DDS en cada
+             * ciclo aunque el valor fuera idéntico. */
             if (want != last_freq) {
                 uint32_t actual = 0;
                 if (ad9833_set_frequency(s_dds, (uint32_t)want, &actual) == ESP_OK) {
                     last_freq = want;
-                    ESP_LOGI(TAG, "frequency -> %d Hz (DDS resolves to %lu Hz)",
+                    ESP_LOGI(TAG, "frecuencia -> %d Hz (el DDS sintetiza %lu Hz)",
                              want, (unsigned long)actual);
                 }
             }
         }
 
         if (v.has_volumen) {
-            /* "volumen" is a servo angle in degrees, not a percentage (M1). */
+            /* "volumen" es un ángulo de servo en grados, no un porcentaje (M1). */
             if (v.volumen != servo_get_angle()) {
                 if (servo_set_angle(v.volumen) == ESP_OK) {
-                    ESP_LOGI(TAG, "volume -> %d deg", servo_get_angle());
+                    ESP_LOGI(TAG, "volumen -> %d grados", servo_get_angle());
                 }
             }
         }
 
         if ((ok % 30) == 0) {
-            ESP_LOGI(TAG, "polls ok=%lu failed=%lu | %d Hz, %d deg | wifi=%s",
+            ESP_LOGI(TAG, "consultas ok=%lu fallidas=%lu | %d Hz, %d grados | wifi=%s",
                      (unsigned long)ok, (unsigned long)failed,
                      last_freq, servo_get_angle(), kundt_wifi_ip());
         }
@@ -135,55 +135,55 @@ static void control_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Kundt tube - E2 audio generation module (ESP-IDF)");
+    ESP_LOGI(TAG, "Tubo de Kundt - módulo E2 de generación de audio (ESP-IDF)");
 
-    /* Started first so the LED reports progress even if provisioning fails. */
+    /* Se arranca primero para que el LED dé señales aunque falle la provisión. */
     ESP_ERROR_CHECK(kundt_led_init(KUNDT_LED_DEFAULT_GPIO));
 
     ESP_ERROR_CHECK(kundt_config_init());
     kundt_config_log();
 
     if (!kundt_config_is_provisioned()) {
-        ESP_LOGE(TAG, "WiFi SSID or server IP not set.");
-        ESP_LOGE(TAG, "Set them with 'idf.py menuconfig' under 'Kundt tube configuration',");
-        ESP_LOGE(TAG, "then erase NVS once with 'idf.py erase-flash' so the new defaults load.");
+        ESP_LOGE(TAG, "Falta el SSID de WiFi o la IP del servidor.");
+        ESP_LOGE(TAG, "Configúralos con 'idf.py menuconfig', menú 'Kundt tube configuration',");
+        ESP_LOGE(TAG, "y luego borra NVS una vez con 'idf.py erase-flash' para que carguen.");
         return;
     }
 
     kundt_config_t cfg;
     ESP_ERROR_CHECK(kundt_config_get(&cfg));
 
-    /* Bring the hardware up before the network: the tube should be producing a
-     * tone even if the backend is unreachable. */
+    /* Levantar el hardware antes que la red: el tubo debe estar emitiendo tono
+     * aunque el backend sea inalcanzable. */
     const ad9833_config_t dds_cfg = AD9833_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(ad9833_init(&dds_cfg, &s_dds));
     ESP_ERROR_CHECK(ad9833_set_waveform(s_dds, AD9833_WAVE_SINE));
 
     uint32_t actual = 0;
     ESP_ERROR_CHECK(ad9833_set_frequency(s_dds, DEFAULT_FREQ_HZ, &actual));
-    ESP_LOGI(TAG, "default tone: %d Hz requested, %lu Hz synthesised",
+    ESP_LOGI(TAG, "tono por defecto: %d Hz pedidos, %lu Hz sintetizados",
              DEFAULT_FREQ_HZ, (unsigned long)actual);
 
 #if CONFIG_E2_SELFTEST
     kundt_led_mark_selftest();
 
-    /* Runs before servo_init(): LEDC claims the pin and the check needs to
-     * drive it as a plain GPIO. */
+    /* Corre antes de servo_init(): LEDC se apropia del pin y esta comprobación
+     * necesita manejarlo como GPIO común. */
     selftest_check_jumper();
 #endif
 
     servo_config_t servo_cfg = SERVO_DEFAULT_CONFIG();
 #if CONFIG_E2_SELFTEST
-    /* Route the PWM to the pin that is jumpered to the ADC, so the mapping can
-     * be measured without a servo attached. */
+    /* Llevar el PWM al pin puenteado con el ADC, para medir el mapeo sin tener
+     * un servo conectado. */
     servo_cfg.gpio = CONFIG_E2_SELFTEST_SERVO_GPIO;
 #endif
     ESP_ERROR_CHECK(servo_init(&servo_cfg));
 
 #if CONFIG_E2_SELFTEST
     if (selftest_init() == ESP_OK) {
-        /* A failed jumper check does not stop the sweep: seeing the readings
-         * next to the verdict is more informative than skipping them. */
+        /* Que falle la comprobación del puente no detiene el barrido: ver las
+         * lecturas junto al veredicto informa más que omitirlas. */
         selftest_run_servo_sweep();
     }
 #endif

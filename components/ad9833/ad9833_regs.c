@@ -1,7 +1,7 @@
 /*
- * ad9833_regs.c - see ad9833_regs.h.
+ * ad9833_regs.c - ver ad9833_regs.h.
  *
- * Compiled both into the firmware and into the host tests.
+ * Se compila tanto en el firmware como en los tests de host.
  */
 
 #include "ad9833_regs.h"
@@ -12,16 +12,16 @@ uint32_t ad9833_freq_word(uint32_t freq_hz, uint32_t mclk_hz)
         return 0;
     }
 
-    /* A DDS cannot synthesise at or above half its clock. Clamp rather than
-     * let the maths wrap, which would emit a plausible-looking alias instead
-     * of an obviously wrong value. */
+    /* Un DDS no puede sintetizar en la mitad de su reloj ni por encima. Se acota
+     * en vez de dejar desbordar la cuenta, que emitiría un alias de aspecto
+     * plausible en lugar de un valor evidentemente incorrecto. */
     const uint32_t nyquist = mclk_hz / 2;
     if (freq_hz >= nyquist) {
         freq_hz = nyquist - 1;
     }
 
-    /* FREQREG = f_out * 2^28 / f_MCLK, rounded to nearest.
-     * 64-bit intermediate: f_out * 2^28 overflows 32 bits above ~16 Hz. */
+    /* FREQREG = f_out * 2^28 / f_MCLK, redondeado al más cercano.
+     * Intermedio de 64 bits: f_out * 2^28 desborda 32 bits pasados los ~16 Hz. */
     const uint64_t num = ((uint64_t)freq_hz << AD9833_FREQ_BITS) + (mclk_hz / 2);
     return (uint32_t)(num / mclk_hz);
 }
@@ -34,7 +34,7 @@ uint32_t ad9833_word_to_freq(uint32_t word, uint32_t mclk_hz)
 
 uint16_t ad9833_control_word(ad9833_waveform_t wave, bool reset)
 {
-    /* B28 stays set: the frequency word is always written as two 14-bit halves. */
+    /* B28 queda siempre activo: la frecuencia se escribe como dos mitades de 14 bits. */
     uint16_t ctrl = AD9833_CTRL_B28;
 
     switch (wave) {
@@ -42,12 +42,14 @@ uint16_t ad9833_control_word(ad9833_waveform_t wave, bool reset)
         ctrl |= AD9833_CTRL_MODE;
         break;
     case AD9833_WAVE_SQUARE:
-        /* MSB of the DAC data routed to VOUT, at MCLK/2. */
+        /* El MSB del DAC sale por VOUT. Con DIV2=1 se entrega sin dividir, así
+         * que la cuadrada queda en la frecuencia programada; con DIV2=0 saldría
+         * a la mitad. */
         ctrl |= AD9833_CTRL_OPBITEN | AD9833_CTRL_DIV2;
         break;
     case AD9833_WAVE_SINE:
     default:
-        break;  /* OPBITEN = 0 and MODE = 0 select the sine ROM. */
+        break;  /* Con OPBITEN = 0 y MODE = 0 se elige la ROM senoidal. */
     }
 
     if (reset) {

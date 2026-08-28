@@ -1,14 +1,13 @@
 /*
- * mic_dsp.h - Pure sample-conversion logic for the Kundt tube microphone module (E1).
+ * mic_dsp.h - Conversión de muestras del micrófono del tubo de Kundt (E1).
  *
- * Deliberately free of any ESP-IDF dependency so it can be compiled and unit
- * tested on the host (see test/host/). The firmware and the tests build the
- * exact same translation unit.
+ * Sin dependencias de ESP-IDF a propósito: el firmware y los tests de host
+ * (test/host/) compilan exactamente la misma unidad de traducción.
  *
- * Background: the ESP32 SAR ADC in DMA (continuous) mode emits 16-bit words
- * laid out as TYPE1 on this target: data in bits 0..11, channel in bits 12..15.
- * A single DMA frame may interleave words belonging to other channels, so the
- * channel field must be checked rather than assumed.
+ * El SAR ADC del ESP32 en modo continuo (DMA) entrega palabras de 16 bits en
+ * formato TYPE1: dato en los bits 0..11, canal en los bits 12..15. Una trama DMA
+ * puede intercalar palabras de otros canales, así que el campo de canal se
+ * comprueba, no se asume.
  */
 #pragma once
 
@@ -20,80 +19,83 @@
 extern "C" {
 #endif
 
-/* 12-bit SAR ADC: raw samples span 0..4095, nominal silence sits at mid-scale. */
+/* SAR ADC de 12 bits: la muestra cruda va de 0 a 4095 y el silencio nominal cae
+ * a media escala. */
 #define MIC_ADC_RAW_MAX      4095u
 #define MIC_ADC_RAW_MIDPOINT 2048u
 
-/* 12-bit -> 16-bit headroom. 4096 * 16 = 65536 covers the full int16 span. */
+/* De 12 a 16 bits: ya centrada, la señal abarca ±2048 cuentas, y ±2048 × 16 es
+ * justo el rango de int16. */
 #define MIC_DSP_GAIN 16
 
 /*
- * DC offset tracker.
+ * Estimador del offset de continua.
  *
- * The analog front end (electret -> preamp -> LM324) is AC-coupled around a DC
- * operating point, so raw samples are unipolar and centred on that offset, not
- * on zero. Emitting them as-is produces PCM that is offset by roughly half of
- * full scale -- audible as clipping/distortion on the listener side. This
- * tracker estimates the offset and removes it, yielding conventional signed PCM.
+ * El frontend analógico (electret -> preamplificador -> LM324) acopla en alterna
+ * sobre un punto de operación en continua: las muestras crudas son unipolares y
+ * están centradas en ese offset, no en cero. Emitirlas tal cual produce un PCM
+ * desplazado media escala, que se oye como saturación. Este estimador mide el
+ * offset y lo resta, dejando PCM con signo convencional.
  *
- * `track == false` pins the estimate to MIC_ADC_RAW_MIDPOINT, which is correct
- * only if the hardware bias is exactly mid-rail.
+ * Con track == false el offset queda fijo en MIC_ADC_RAW_MIDPOINT, lo que sólo
+ * es correcto si la polarización del hardware cae exactamente a media escala.
  */
 typedef struct {
-    int32_t dc_q16;   /* Offset estimate in Q16.16 (raw ADC counts). */
-    uint8_t shift;    /* Smoothing factor: larger = slower, steadier tracking. */
-    bool    track;    /* false pins the estimate at mid-scale. */
+    int32_t dc_q16;   /* Offset estimado en Q16.16, en cuentas del ADC. */
+    uint8_t shift;    /* Suavizado: mayor = seguimiento más lento y más estable. */
+    bool    track;    /* false fija el offset a media escala. */
 } mic_dsp_t;
 
-/* Smoothing default: ~2^10 samples of memory (~23 ms at 44.1 kHz).
- * Fast enough to settle at start-up, far below the audio band so it does not
- * attenuate low-frequency content of interest. */
+/* Suavizado por defecto: memoria de ~2^10 muestras (~23 ms a 44,1 kHz). Rápido
+ * para asentarse al arrancar, y muy por debajo de la banda de audio, así que no
+ * atenúa las bajas frecuencias de interés. */
 #define MIC_DSP_DC_SHIFT_DEFAULT 10
 
 /**
- * @brief Initialise the converter.
- * @param dsp    Instance to initialise (must not be NULL).
- * @param track  Follow the measured DC offset instead of assuming mid-scale.
- * @param shift  Smoothing factor; clamped to 1..30. Ignored when track==false.
+ * @brief Inicializa el conversor.
+ * @param dsp    Instancia a inicializar (no puede ser NULL).
+ * @param track  Seguir el offset medido en vez de suponer media escala.
+ * @param shift  Suavizado; se acota a 1..30. Se ignora si track == false.
  */
 void mic_dsp_init(mic_dsp_t *dsp, bool track, uint8_t shift);
 
-/** @brief Extract the 12-bit sample value from a raw ADC DMA word. */
+/** @brief Extrae el valor de 12 bits de una palabra cruda del DMA. */
 static inline uint16_t mic_word_value(uint16_t word)
 {
     return (uint16_t)(word & 0x0FFFu);
 }
 
-/** @brief Extract the channel index from a raw ADC DMA word. */
+/** @brief Extrae el índice de canal de una palabra cruda del DMA. */
 static inline uint8_t mic_word_channel(uint16_t word)
 {
     return (uint8_t)((word >> 12) & 0x0Fu);
 }
 
 /**
- * @brief Convert one raw sample to signed 16-bit PCM, updating the DC estimate.
+ * @brief Convierte una muestra cruda a PCM de 16 bits con signo, actualizando el
+ *        offset estimado.
  *
- * Values above MIC_ADC_RAW_MAX are clamped; the result saturates at the int16
- * limits rather than wrapping.
+ * Los valores sobre MIC_ADC_RAW_MAX se recortan, y el resultado satura en los
+ * límites de int16 en vez de desbordar.
  */
 int16_t mic_dsp_convert(mic_dsp_t *dsp, uint16_t raw12);
 
 /**
- * @brief Convert a DMA frame: filter by channel, convert, and count rejects.
+ * @brief Procesa una trama DMA: filtra por canal, convierte y cuenta descartes.
  *
- * This is the hot path. Words whose channel field does not match @p channel are
- * skipped -- they belong to another conversion pattern and must not reach the
- * audio stream.
+ * Es el camino crítico. Las palabras cuyo campo de canal no coincide con
+ * @p channel se descartan: pertenecen a otro patrón de conversión y no deben
+ * entrar al flujo de audio.
  *
- * @param dsp      Converter state.
- * @param words    Raw 16-bit ADC words straight from the DMA buffer.
- * @param n_words  Number of words available in @p words.
- * @param channel  ADC channel to keep.
- * @param out      Destination PCM buffer.
- * @param out_cap  Capacity of @p out, in samples.
- * @param dropped  Optional; receives the count of words rejected by the channel
- *                 filter. Pass NULL if not needed.
- * @return Number of PCM samples written to @p out.
+ * @param dsp      Estado del conversor.
+ * @param words    Palabras crudas de 16 bits tal como salen del buffer DMA.
+ * @param n_words  Palabras disponibles en @p words.
+ * @param channel  Canal del ADC que se conserva.
+ * @param out      Buffer PCM de destino.
+ * @param out_cap  Capacidad de @p out, en muestras.
+ * @param dropped  Opcional; recibe cuántas palabras rechazó el filtro de canal.
+ *                 NULL si no interesa.
+ * @return Muestras PCM escritas en @p out.
  */
 size_t mic_dsp_process(mic_dsp_t *dsp,
                        const uint16_t *words,
@@ -103,22 +105,22 @@ size_t mic_dsp_process(mic_dsp_t *dsp,
                        size_t          out_cap,
                        uint32_t       *dropped);
 
-/** @brief Current DC offset estimate, in raw ADC counts. */
+/** @brief Offset de continua estimado, en cuentas del ADC. */
 int32_t mic_dsp_dc_offset(const mic_dsp_t *dsp);
 
-/** @brief Summary of one PCM block. Enough to tell signal from a floating pin. */
+/** @brief Resumen de un bloque PCM. Basta para distinguir señal de un pin al aire. */
 typedef struct {
     int16_t  min;
     int16_t  max;
-    uint64_t sum_sq;  /* Sum of squares; RMS = sqrt(sum_sq / n). */
+    uint64_t sum_sq;  /* Suma de cuadrados; RMS = sqrt(sum_sq / n). */
     size_t   n;
 } mic_pcm_stats_t;
 
 /**
- * @brief Measure a PCM block: min, max and sum of squares.
+ * @brief Mide un bloque PCM: mínimo, máximo y suma de cuadrados.
  *
- * Kept here (rather than in mic_capture) so it stays free of ESP-IDF and can be
- * unit tested on the host like the rest of the conversion path.
+ * Vive aquí y no en mic_capture para seguir libre de ESP-IDF y poder probarse en
+ * el host junto al resto de la conversión.
  */
 void mic_dsp_analyze(const int16_t *pcm, size_t n, mic_pcm_stats_t *out);
 

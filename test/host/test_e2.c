@@ -1,11 +1,11 @@
 /*
- * Host tests for the pure logic of module E2 (audio generation).
+ * Tests de host de la lógica pura del módulo E2 (generación de audio).
  *
- * Covers the three places where E2 can be wrong in ways that are invisible on
- * a bench: the AD9833 tuning-word maths, the servo angle mapping, and the
- * parsing of the backend response.
+ * Cubren los tres puntos donde E2 puede fallar de forma invisible en el banco:
+ * la aritmética de la palabra de sintonía del AD9833, el mapeo de ángulo del
+ * servo y el parseo de la respuesta del backend.
  *
- * Build and run:  make -C test/host e2
+ * Compilar y ejecutar:  make -C test/host e2
  */
 
 #include <stdio.h>
@@ -31,10 +31,10 @@ static int g_checks, g_failures;
 
 static void test_ad9833_freq_word(void)
 {
-    printf("  AD9833 tuning word follows the data sheet formula\n");
+    printf("  la palabra de sintonía del AD9833 sigue la fórmula del datasheet\n");
 
     /* FREQREG = f_out * 2^28 / f_MCLK.
-     * 1200 Hz on a 25 MHz crystal: 1200 * 268435456 / 25e6 = 12884.9 -> 12885. */
+     * 1200 Hz con cristal de 25 MHz: 1200 * 268435456 / 25e6 = 12884,9 -> 12885. */
     const uint32_t w = ad9833_freq_word(1200, 25000000);
     CHECK(w == 12885, "1200 Hz -> 12885, got %u", w);
 
@@ -44,15 +44,15 @@ static void test_ad9833_freq_word(void)
     CHECK(ad9833_freq_word(0, 25000000) == 0, "0 Hz -> word 0");
     CHECK(ad9833_freq_word(1000, 0) == 0, "zero MCLK yields 0 rather than dividing");
 
-    /* The word must never exceed 28 bits, or it corrupts the register address
-     * bits once split into the two 14-bit halves. */
+    /* La palabra nunca debe pasar de 28 bits: al partirla en las dos mitades de
+     * 14 corrompería los bits de dirección de registro. */
     const uint32_t hi = ad9833_freq_word(10000000, 25000000);
     CHECK(hi < (1u << 28), "word stays inside 28 bits, got %u", hi);
 }
 
 static void test_ad9833_nyquist_clamp(void)
 {
-    printf("  frequencies at or above Nyquist are clamped, not wrapped\n");
+    printf("  las frecuencias desde Nyquist se acotan, no desbordan\n");
 
     const uint32_t at    = ad9833_freq_word(12500000, 25000000);
     const uint32_t above = ad9833_freq_word(20000000, 25000000);
@@ -64,7 +64,7 @@ static void test_ad9833_nyquist_clamp(void)
 
 static void test_ad9833_split(void)
 {
-    printf("  the 28-bit word splits into two addressed 14-bit halves\n");
+    printf("  la palabra de 28 bits se parte en dos mitades de 14 direccionadas\n");
 
     const uint32_t w = ad9833_freq_word(1200, 25000000);
     const uint16_t lsb = ad9833_freq_lsb(w);
@@ -79,7 +79,7 @@ static void test_ad9833_split(void)
 
 static void test_ad9833_control(void)
 {
-    printf("  control words select the right waveform\n");
+    printf("  las palabras de control eligen la forma de onda correcta\n");
 
     const uint16_t sine = ad9833_control_word(AD9833_WAVE_SINE, false);
     CHECK(sine == 0x2000, "sine -> 0x2000, got 0x%04x", sine);
@@ -98,7 +98,7 @@ static void test_ad9833_control(void)
 
 static void test_servo_mapping(void)
 {
-    printf("  servo angles map onto standard 0.5-2.5 ms pulses\n");
+    printf("  los ángulos del servo mapean a pulsos estándar de 0,5-2,5 ms\n");
 
     CHECK(servo_angle_to_pulse_us(0)   == 500,  "0 deg -> 500 us");
     CHECK(servo_angle_to_pulse_us(90)  == 1500, "90 deg -> 1500 us");
@@ -118,11 +118,11 @@ static void test_servo_mapping(void)
 
 static void test_servo_clamping(void)
 {
-    printf("  out-of-range angles are clamped (finding M1)\n");
+    printf("  los ángulos fuera de rango se acotan (hallazgo M1)\n");
 
-    /* The Arduino build handed the backend value straight to Servo::write(),
-     * where anything >= 544 is reinterpreted as microseconds and drives the
-     * servo into its end stop. */
+    /* La versión Arduino entregaba el valor del backend directo a
+     * Servo::write(), donde cualquier cifra >= 544 se reinterpreta como
+     * microsegundos y empuja el servo contra su tope. */
     CHECK(servo_clamp_angle(-1)    == 0,   "negative clamps to 0");
     CHECK(servo_clamp_angle(-1000) == 0,   "very negative clamps to 0");
     CHECK(servo_clamp_angle(181)   == 180, "above range clamps to 180");
@@ -136,7 +136,7 @@ static void test_servo_clamping(void)
 
 static void test_api_parse_valid(void)
 {
-    printf("  a well-formed response parses\n");
+    printf("  una respuesta bien formada se parsea\n");
 
     kundt_valores_t v;
     const char *body = "{\"valores\":{\"frecuencia\":1500,\"volumen\":90,\"embolo\":42.5}}";
@@ -149,13 +149,13 @@ static void test_api_parse_valid(void)
 
 static void test_api_parse_rejects_garbage(void)
 {
-    printf("  malformed responses are rejected, not silently zeroed (finding A4)\n");
+    printf("  las respuestas malformadas se rechazan, no se anulan en silencio (hallazgo A4)\n");
 
     kundt_valores_t v;
 
-    /* The exact failure mode of the Arduino build: a 404 HTML page fed to the
-     * JSON parser, error ignored, every field read back as 0 -- which drove the
-     * generator to 0 Hz and the servo to 0 degrees. */
+    /* El fallo exacto de la versión Arduino: una página HTML de 404 entregada al
+     * parser JSON, el error ignorado y todos los campos leídos como 0, lo que
+     * llevaba el generador a 0 Hz y el servo a 0 grados. */
     const char *html = "<!DOCTYPE html><html><body>404 Not Found</body></html>";
     CHECK(kundt_api_parse_valores(html, &v) != 0, "an HTML error page is rejected");
 
@@ -169,7 +169,7 @@ static void test_api_parse_rejects_garbage(void)
 
 static void test_api_parse_partial(void)
 {
-    printf("  missing fields are distinguished from zero values\n");
+    printf("  se distinguen los campos ausentes de los que valen cero\n");
 
     kundt_valores_t v;
 
@@ -189,14 +189,14 @@ static void test_api_parse_partial(void)
 
 static void test_api_end_to_end_ranges(void)
 {
-    printf("  parsed values survive the clamps used by the firmware\n");
+    printf("  los valores parseados sobreviven los acotados del firmware\n");
 
     kundt_valores_t v;
     CHECK(kundt_api_parse_valores(
               "{\"valores\":{\"frecuencia\":1200,\"volumen\":270}}", &v) == 0, "parses");
 
-    /* 270 deg is what a 270-degree potentiometer suggests, but the servo only
-     * spans 180 -- the README flags this mismatch explicitly. */
+    /* 270 grados es lo que sugiere un potenciómetro de 270 grados, pero el servo
+     * sólo recorre 180: el README señala explícitamente ese desajuste. */
     CHECK(servo_clamp_angle(v.volumen) == 180, "270 deg clamps to the servo's 180");
 
     const uint32_t w = ad9833_freq_word((uint32_t)v.frecuencia, AD9833_DEFAULT_MCLK_HZ);
@@ -205,8 +205,8 @@ static void test_api_end_to_end_ranges(void)
 
 int main(void)
 {
-    printf("E2-SineGen host tests\n");
-    printf("=====================\n");
+    printf("Tests de host de E2-SineGen\n");
+    printf("===========================\n");
 
     test_ad9833_freq_word();
     test_ad9833_nyquist_clamp();
@@ -219,7 +219,7 @@ int main(void)
     test_api_parse_partial();
     test_api_end_to_end_ranges();
 
-    printf("\n%d checks, %d failures\n", g_checks, g_failures);
+    printf("\n%d comprobaciones, %d fallos\n", g_checks, g_failures);
     if (g_failures == 0) { printf("PASS\n"); return 0; }
     printf("FAIL\n");
     return 1;

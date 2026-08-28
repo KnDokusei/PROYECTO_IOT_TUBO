@@ -1,16 +1,17 @@
 /*
- * E1-Mic - Kundt tube microphone module, ESP-IDF port.
+ * E1-Mic - Módulo de micrófono del tubo de Kundt, port a ESP-IDF.
  *
- * Role (per the project README): monitor the audio the speaker module (E2)
- * injects into the tube, using the microphone fixed at the tube inlet, and
- * stream it to the server over a binary WebSocket so the remote user can listen
- * to the standing wave as the piston sweeps.
+ * Función (según el README del proyecto): escuchar con el micrófono fijo en la
+ * entrada del tubo el audio que el módulo de parlante (E2) inyecta, y enviarlo
+ * al servidor por un WebSocket binario, para que el usuario remoto oiga la onda
+ * estacionaria mientras el émbolo barre la longitud.
  *
- * Signal path: electret mic -> preamp -> LM324 -> GPIO34 (ADC1_CH6)
- *              -> SAR ADC in DMA continuous mode -> PCM16 -> WebSocket.
+ * Cadena de señal: micrófono electret -> preamplificador -> LM324 -> GPIO34
+ *                  (ADC1_CH6) -> SAR ADC en modo continuo por DMA -> PCM16
+ *                  -> WebSocket.
  *
- * Ported from the Arduino sketch that used the legacy I2S built-in ADC mode,
- * which no longer exists in current ESP-IDF. See MIGRACION-E1.md.
+ * Portado del sketch de Arduino, que usaba el modo ADC interno del driver I2S
+ * antiguo, hoy inexistente en ESP-IDF. Ver MIGRACION-E1.md.
  */
 
 #include <stdio.h>
@@ -35,15 +36,16 @@
 
 static const char *TAG = "E1-Mic";
 
-/* One PCM block per WebSocket frame. Matches the DMA frame size so a read maps
- * to exactly one send: 512 samples = 1024 bytes, ~86 frames/s at 44.1 kHz. */
+/* Un bloque PCM por trama de WebSocket. Coincide con el tamaño de trama del DMA
+ * para que cada lectura sea exactamente un envío: 512 muestras = 1024 bytes,
+ * ~86 tramas/s a 44,1 kHz. */
 #define PCM_BLOCK_SAMPLES 512
 
-/* Long enough that a quiet tube does not spam timeouts, short enough that a
- * stalled ADC is noticed promptly. */
+/* Suficientemente largo para que un tubo en silencio no llene el log de
+ * timeouts, y suficientemente corto para notar pronto un ADC detenido. */
 #define ADC_READ_TIMEOUT_MS 200
 
-/* Progress logging cadence. */
+/* Cadencia del log de avance. */
 #define STATS_INTERVAL_MS 10000
 
 static esp_websocket_client_handle_t s_ws;
@@ -60,13 +62,13 @@ static void ws_event_handler(void            *arg,
 
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "websocket connected");
+        ESP_LOGI(TAG, "websocket conectado");
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "websocket disconnected, client will retry");
+        ESP_LOGW(TAG, "websocket desconectado; el cliente reintentará");
         break;
     case WEBSOCKET_EVENT_ERROR:
-        ESP_LOGE(TAG, "websocket error (esp_tls err=0x%x)",
+        ESP_LOGE(TAG, "error de websocket (esp_tls err=0x%x)",
                  ev ? ev->error_handle.esp_tls_last_esp_err : 0);
         break;
     default:
@@ -79,16 +81,16 @@ static esp_err_t websocket_start(void)
     char uri[64];
     esp_err_t err = kundt_config_ws_uri(uri, sizeof(uri));
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "cannot build websocket URI: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "no se pudo construir la URI del websocket: %s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "websocket target: %s", uri);
+    ESP_LOGI(TAG, "destino del websocket: %s", uri);
 
     const esp_websocket_client_config_t cfg = {
         .uri                 = uri,
-        /* The client reconnects on its own; the Arduino build relied on a
-         * callback that was never dispatched because poll() was never called. */
+        /* El cliente reconecta solo. La versión Arduino dependía de un callback
+         * que nunca se despachaba, porque nunca se llamaba a poll(). */
         .reconnect_timeout_ms = 5000,
         .network_timeout_ms   = 10000,
         .buffer_size          = PCM_BLOCK_SAMPLES * sizeof(int16_t) * 2,
@@ -97,7 +99,7 @@ static esp_err_t websocket_start(void)
 
     s_ws = esp_websocket_client_init(&cfg);
     if (s_ws == NULL) {
-        ESP_LOGE(TAG, "esp_websocket_client_init failed");
+        ESP_LOGE(TAG, "esp_websocket_client_init falló");
         return ESP_FAIL;
     }
 
@@ -109,12 +111,12 @@ static esp_err_t websocket_start(void)
 
 #if CONFIG_E1_SELFTEST_DAC
 /*
- * Feeds the ADC from the chip own cosine-wave generator so the whole capture
- * path can be exercised with no microphone and no signal generator. Needs a
- * jumper from the DAC pin to GPIO34.
+ * Alimenta el ADC con el generador de coseno del propio chip, para ejercitar
+ * toda la cadena de captura sin micrófono ni generador de señales. Requiere un
+ * puente del pin del DAC a GPIO34.
  *
- * The generator is driven by the RTC clock and is independent of the I2S0
- * block the continuous ADC driver uses, so the two can run at once.
+ * El generador se reloja con RTC_FAST, independiente del bloque I2S0 que usa el
+ * driver continuo del ADC, así que ambos pueden correr a la vez.
  */
 static void selftest_dac_start(void)
 {
@@ -130,10 +132,12 @@ static void selftest_dac_start(void)
         .clk_src = DAC_COSINE_CLK_SRC_DEFAULT,
         .atten   = DAC_COSINE_ATTEN_DB_6,
         .phase   = DAC_COSINE_PHASE_0,
-        /* The offset is written straight into the DAC's 8-bit DC register. With
-         * offset 0 the cosine swings around 0 V and the DAC clips every negative
-         * half-cycle, so the ADC only ever sees a rectified stub. Biasing to
-         * ~100/255 puts the whole waveform inside the converter's range. */
+        /* El offset va directo al registro de continua de 8 bits del DAC. Con
+         * offset 0 el coseno oscila en torno a 0 V y el DAC recorta cada
+         * semiciclo negativo, dejando al ADC sólo un resto rectificado. Con 100
+         * la onda entra completa en el rango del conversor. Medido en placa da
+         * dc≈522 cuentas: el registro no escala como fracción directa del fondo
+         * de escala, así que este valor es empírico, no calculado. */
         .offset  = 100,
         .flags   = { .force_set_freq = true },
     };
@@ -141,10 +145,10 @@ static void selftest_dac_start(void)
     ESP_ERROR_CHECK(dac_cosine_new_channel(&cfg, &handle));
     ESP_ERROR_CHECK(dac_cosine_start(handle));
 
-    ESP_LOGW(TAG, "SELF-TEST: %d Hz cosine on GPIO%d",
+    ESP_LOGW(TAG, "AUTOPRUEBA: coseno de %d Hz en GPIO%d",
              CONFIG_E1_SELFTEST_DAC_FREQ,
              CONFIG_E1_SELFTEST_DAC_GPIO25 ? 25 : 26);
-    ESP_LOGW(TAG, "SELF-TEST: jumper GPIO%d -> GPIO34 required",
+    ESP_LOGW(TAG, "AUTOPRUEBA: se requiere puente GPIO%d -> GPIO34",
              CONFIG_E1_SELFTEST_DAC_GPIO25 ? 25 : 26);
 }
 #endif /* CONFIG_E1_SELFTEST_DAC */
@@ -152,10 +156,10 @@ static void selftest_dac_start(void)
 
 #if CONFIG_E1_SELFTEST_DAC
 /*
- * Dumps one block of PCM as hex over the console, once, a few seconds after
- * capture starts (i.e. after the DC tracker has settled). Lets the whole
- * ADC -> DSP path be checked against a known tone on a host, with no network
- * and no server: frequency, symmetry and waveform shape all come out of it.
+ * Vuelca una vez un bloque PCM en hexadecimal por consola, unos segundos después
+ * de arrancar la captura (o sea, ya asentado el estimador de continua). Permite
+ * verificar toda la cadena ADC -> DSP contra un tono conocido desde el PC, sin
+ * red ni servidor: de ahí salen frecuencia, simetría y forma de onda.
  */
 static void selftest_dump_block(const int16_t *pcm, size_t n)
 {
@@ -184,7 +188,7 @@ static void mic_stream_task(void *arg)
     uint64_t sent_bytes = 0;
     uint32_t send_fails = 0;
 
-    ESP_LOGI(TAG, "streaming task started on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "tarea de streaming iniciada en el núcleo %d", xPortGetCoreID());
 
     for (;;) {
         size_t    samples = 0;
@@ -192,7 +196,7 @@ static void mic_stream_task(void *arg)
                                          ADC_READ_TIMEOUT_MS);
 
         if (err == ESP_ERR_TIMEOUT) {
-            continue;  /* No conversions ready yet; not an error. */
+            continue;  /* Aún no hay conversiones listas; no es un error. */
         }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "mic_capture_read: %s", esp_err_to_name(err));
@@ -204,7 +208,7 @@ static void mic_stream_task(void *arg)
         }
 
 #if CONFIG_E1_SELFTEST_DAC
-        /* Wait ~3 s of audio so the DC estimate has converged before dumping. */
+        /* Esperar ~3 s de audio para volcar con el offset ya convergido. */
         if (mic_capture_is_running()) {
             static uint32_t blocks;
             if (++blocks == 260) {
@@ -213,15 +217,16 @@ static void mic_stream_task(void *arg)
         }
 #endif
 
-        /* Drop audio while the link is down rather than blocking the ADC path:
-         * the tube keeps running and stale audio is worthless to the listener. */
+        /* Con el enlace caído se descarta el audio en vez de bloquear la cadena
+         * del ADC: el tubo sigue funcionando y el audio viejo no le sirve a
+         * nadie. */
         if (esp_websocket_client_is_connected(s_ws)) {
             const int bytes = (int)(samples * sizeof(int16_t));
             const int wrote  = esp_websocket_client_send_bin(
                 s_ws, (const char *)s_pcm, bytes, pdMS_TO_TICKS(1000));
 
             if (wrote < 0) {
-                send_fails++;  /* Counted, not logged: this is the hot path. */
+                send_fails++;  /* Se cuenta, no se registra: es el camino crítico. */
             } else {
                 sent_bytes += (uint64_t)wrote;
             }
@@ -240,7 +245,7 @@ static void mic_stream_task(void *arg)
             mic_capture_get_stats(&st);
 
             ESP_LOGI(TAG,
-                     "ADC  captured=%llu dc=%ld min=%d max=%d rms=%lu drop=%llu ovf=%lu",
+                     "ADC  captadas=%llu dc=%ld min=%d max=%d rms=%lu descartes=%llu ovf=%lu",
                      (unsigned long long)st.samples_captured,
                      (long)st.dc_offset,
                      (int)st.pcm_min,
@@ -249,15 +254,16 @@ static void mic_stream_task(void *arg)
                      (unsigned long long)st.words_dropped,
                      (unsigned long)st.pool_overflows);
             ESP_LOGI(TAG,
-                     "NET  wifi=%s(%lu drops) ws=%s sent=%lluKiB failed=%lu",
+                     "RED  wifi=%s(%lu caídas) ws=%s enviado=%lluKiB fallos=%lu",
                      kundt_wifi_ip(),
                      (unsigned long)kundt_wifi_disconnect_count(),
-                     esp_websocket_client_is_connected(s_ws) ? "up" : "down",
+                     esp_websocket_client_is_connected(s_ws) ? "arriba" : "abajo",
                      (unsigned long long)(sent_bytes / 1024),
                      (unsigned long)send_fails);
-            /* Heap is the figure that betrays a leak in the streaming path:
-             * a slow drift down over hours is what takes a lab rig offline. */
-            ESP_LOGI(TAG, "SYS  uptime=%llus heap=%u min_heap=%u",
+            /* El heap es la cifra que delata una fuga en la cadena de envío:
+             * una caída lenta a lo largo de horas es lo que deja el equipo del
+             * laboratorio fuera de servicio. */
+            ESP_LOGI(TAG, "SIS  encendido=%llus heap=%u heap_min=%u",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)esp_get_minimum_free_heap_size());
@@ -267,18 +273,18 @@ static void mic_stream_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Kundt tube - E1 microphone module (ESP-IDF)");
+    ESP_LOGI(TAG, "Tubo de Kundt - módulo E1 de micrófono (ESP-IDF)");
 
-    /* Started first so the LED shows life even if provisioning fails. */
+    /* Se arranca primero para que el LED dé señales aunque falle la provisión. */
     ESP_ERROR_CHECK(kundt_led_init(KUNDT_LED_DEFAULT_GPIO));
 
     ESP_ERROR_CHECK(kundt_config_init());
     kundt_config_log();
 
     if (!kundt_config_is_provisioned()) {
-        ESP_LOGE(TAG, "WiFi SSID or server IP not set.");
-        ESP_LOGE(TAG, "Set them with 'idf.py menuconfig' under 'Kundt tube configuration',");
-        ESP_LOGE(TAG, "then erase NVS once with 'idf.py erase-flash' so the new defaults load.");
+        ESP_LOGE(TAG, "Falta el SSID de WiFi o la IP del servidor.");
+        ESP_LOGE(TAG, "Configúralos con 'idf.py menuconfig', menú 'Kundt tube configuration',");
+        ESP_LOGE(TAG, "y luego borra NVS una vez con 'idf.py erase-flash' para que carguen.");
         return;
     }
 
@@ -288,11 +294,11 @@ void app_main(void)
     ESP_ERROR_CHECK(kundt_wifi_init());
     ESP_ERROR_CHECK(kundt_wifi_connect(cfg.wifi_ssid, cfg.wifi_password));
 
-    /* Wait for the first association so the WebSocket does not start against a
-     * down interface. If it times out we continue anyway: the WiFi component
-     * keeps retrying and the WebSocket client tolerates an unreachable host. */
+    /* Esperar la primera asociación para no arrancar el WebSocket contra una
+     * interfaz caída. Si vence el plazo se continúa igual: el componente de WiFi
+     * sigue reintentando y el cliente WebSocket tolera un host inalcanzable. */
     if (kundt_wifi_wait_connected(30000) != ESP_OK) {
-        ESP_LOGW(TAG, "no WiFi after 30 s, continuing (retries run in background)");
+        ESP_LOGW(TAG, "sin WiFi tras 30 s; se continúa (los reintentos siguen en segundo plano)");
     }
 
     ESP_ERROR_CHECK(websocket_start());
@@ -305,6 +311,6 @@ void app_main(void)
     const mic_capture_config_t mic_cfg = MIC_CAPTURE_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(mic_capture_start(&mic_cfg));
 
-    /* Core 1 keeps the streaming path off core 0, where the WiFi stack runs. */
+    /* El núcleo 1 mantiene la cadena de envío fuera del 0, donde corre WiFi. */
     xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 1);
 }

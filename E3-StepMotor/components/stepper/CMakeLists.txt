@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "main.c" "selftest.c"
-    INCLUDE_DIRS "."
-    REQUIRES kundt_config kundt_wifi kundt_api kundt_led stepper esp_timer esp_driver_pcnt esp_driver_gpio
+    SRCS "stepper.c" "stepper_math.c"
+    INCLUDE_DIRS "include"
+    REQUIRES esp_driver_gpio esp_driver_gptimer esp_timer
 )
 
 # Treat warnings as errors in our own code (not in IDF/managed components).

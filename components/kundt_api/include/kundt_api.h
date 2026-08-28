@@ -1,18 +1,18 @@
 /*
- * kundt_api.h - Client for the Kundt tube lab backend.
+ * kundt_api.h - Cliente del backend del laboratorio del tubo de Kundt.
  *
- * Shared by E2 and E3: in the Arduino build apiGET() was copy-pasted verbatim
- * into both sketches because the IDE cannot share functions between sketches.
+ * Compartido por E2 y E3: en la versión Arduino, apiGET() estaba copiado textual
+ * en ambos sketches, porque el IDE no permite compartir funciones entre sketches.
  *
- * Contract (reverse-engineered from the original sketches; the backend has no
- * written spec):
+ * Contrato (deducido de los sketches originales; el backend no tiene especificación
+ * escrita):
  *
  *   GET /api/kundt/equipo/{kit}
  *     -> {"valores": {"frecuencia": int, "volumen": int, "embolo": float}}
  *
- * Note on "volumen": despite the name it is NOT a percentage. The original
- * firmware wrote it straight to the servo as an angle in degrees, so the
- * calibration lives in the backend. See finding M1.
+ * Sobre "volumen": pese al nombre NO es un porcentaje. El firmware original lo
+ * escribía directo al servo como ángulo en grados, así que la calibración vive
+ * en el backend. Ver hallazgo M1.
  */
 #pragma once
 
@@ -25,49 +25,65 @@
 extern "C" {
 #endif
 
-/* Values read from the backend. The `has_*` flags distinguish "absent from the
- * response" from "present and zero" -- the Arduino build could not, and a
- * missing field silently became 0, driving the generator to 0 Hz. */
+/* Valores leídos del backend. Las banderas `has_*` distinguen "ausente en la
+ * respuesta" de "presente y valiendo cero"; la versión Arduino no podía, y un
+ * campo faltante se volvía 0 en silencio, llevando el generador a 0 Hz. */
 typedef struct {
     int   frecuencia;   /* Hz */
-    int   volumen;      /* servo degrees, see note above */
-    float embolo;       /* piston position; units unconfirmed, see finding A3 */
+    int   volumen;      /* grados del servo, ver la nota de arriba */
+    float embolo;       /* posición del émbolo; unidades sin confirmar, hallazgo A3 */
     bool  has_frecuencia;
     bool  has_volumen;
     bool  has_embolo;
 } kundt_valores_t;
 
 /**
- * @brief Configure the client. Does not perform any request.
- * @param server_ip Dotted-quad address of the backend.
- * @param port      Backend port (5000 in this deployment).
- * @param kit       Rig number, 1..5.
+ * @brief Configura el cliente. No realiza ninguna petición.
+ * @param server_ip Dirección IPv4 del backend en notación decimal punteada.
+ * @param port      Puerto del backend (5000 en esta instalación).
+ * @param kit       Número de equipo, 1..5.
  */
 esp_err_t kundt_api_init(const char *server_ip, uint16_t port, uint8_t kit);
 
 /**
- * @brief GET the current setpoints.
+ * @brief Pide por GET las consignas actuales.
  *
- * Unlike the Arduino version, an HTTP error status is an error here:
- * esp_http_client keeps the transport result (esp_err_t) and the HTTP status
- * code apart, so a 404 can no longer be mistaken for success (finding A4).
+ * A diferencia de la versión Arduino, aquí un estado HTTP de error sí es un
+ * error: esp_http_client mantiene separados el resultado del transporte
+ * (esp_err_t) y el código de estado HTTP, así que un 404 ya no puede confundirse
+ * con un éxito (hallazgo A4).
  *
- * @return ESP_OK; ESP_ERR_INVALID_RESPONSE on a non-200 status or unparseable
- *         body; or the transport error from esp_http_client.
+ * @return ESP_OK; ESP_ERR_INVALID_RESPONSE si el estado no es 200 o el cuerpo no
+ *         se puede parsear; o el error de transporte de esp_http_client.
  */
 esp_err_t kundt_api_get_valores(kundt_valores_t *out);
 
-/** @brief Endpoint the client is pointed at, for logging. */
+/**
+ * @brief Informa por PUT la posición actual del émbolo, en centímetros.
+ *
+ * Sólo lo usa E3. La clave del cuerpo es "posicion", distinta de la que se lee
+ * en el GET ("valores.embolo"): esa asimetría es el hallazgo A3 y está
+ * documentada en stepper_math.h.
+ *
+ * Como en el GET, un estado HTTP distinto de 200 es un error y no un éxito
+ * (hallazgo A4).
+ *
+ * @return ESP_OK; ESP_ERR_INVALID_RESPONSE si el estado no es 2xx; o el error
+ *         de transporte de esp_http_client.
+ */
+esp_err_t kundt_api_put_posicion(float posicion_cm);
+
+/** @brief Endpoint al que apunta el cliente, para el log. */
 const char *kundt_api_url(void);
 
 /**
- * @brief Parse a response body. Exposed for testing.
+ * @brief Parsea el cuerpo de una respuesta. Expuesta para los tests.
  *
- * Split from the HTTP layer so the JSON handling can be exercised on the host
- * against malformed and hostile inputs.
+ * Separada de la capa HTTP para poder ejercitar el manejo de JSON en el host
+ * contra entradas malformadas y hostiles.
  *
- * @return ESP_OK, or ESP_ERR_INVALID_RESPONSE if the body is not valid JSON or
- *         has no "valores" object.
+ * @return ESP_OK, o ESP_ERR_INVALID_RESPONSE si el cuerpo no es JSON válido o no
+ *         trae el objeto "valores".
  */
 esp_err_t kundt_api_parse_valores(const char *body, kundt_valores_t *out);
 

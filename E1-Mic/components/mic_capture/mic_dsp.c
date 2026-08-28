@@ -1,15 +1,15 @@
 /*
- * mic_dsp.c - see mic_dsp.h.
+ * mic_dsp.c - ver mic_dsp.h.
  *
- * No ESP-IDF headers here on purpose: this file is compiled both into the
- * firmware and into the host test runner.
+ * Sin cabeceras de ESP-IDF a propósito: este archivo se compila tanto en el
+ * firmware como en los tests de host.
  */
 
 #include "mic_dsp.h"
 
-/* Q16.16 fixed point is used for the DC estimate so that a smoothing shift of
- * up to 30 still resolves sub-count changes; a plain integer estimate would
- * quantise to zero and never converge. */
+/* El offset se lleva en punto fijo Q16.16 para que un suavizado de hasta 30
+ * siga resolviendo cambios menores a una cuenta; en entero puro el término de
+ * corrección se cuantizaría a cero y el estimador nunca convergería. */
 #define Q16_SHIFT 16
 #define Q16_ONE   (1 << Q16_SHIFT)
 
@@ -30,8 +30,8 @@ void mic_dsp_init(mic_dsp_t *dsp, bool track, uint8_t shift)
 
     dsp->shift = shift;
     dsp->track = track;
-    /* Seed at mid-scale: with tracking on this is only a starting point, and it
-     * keeps the very first samples sane while the estimate settles. */
+    /* Semilla a media escala: con seguimiento activo es sólo un punto de
+     * partida, y mantiene sensatas las primeras muestras mientras converge. */
     dsp->dc_q16 = (int32_t)MIC_ADC_RAW_MIDPOINT << Q16_SHIFT;
 }
 
@@ -56,14 +56,14 @@ int16_t mic_dsp_convert(mic_dsp_t *dsp, uint16_t raw12)
     const int32_t raw_q16 = (int32_t)raw12 << Q16_SHIFT;
 
     if (dsp->track) {
-        /* First-order IIR: dc += (raw - dc) >> shift. */
+        /* IIR de primer orden: dc += (raw - dc) >> shift. */
         dsp->dc_q16 += (raw_q16 - dsp->dc_q16) >> dsp->shift;
     } else {
         dsp->dc_q16 = (int32_t)MIC_ADC_RAW_MIDPOINT << Q16_SHIFT;
     }
 
-    /* Centre, then scale 12-bit counts up to the int16 range. Done in int32 so
-     * a full-scale excursion cannot overflow before the clamp. */
+    /* Centrar y luego escalar de 12 bits al rango de int16. En int32 para que
+     * una excursión a fondo de escala no desborde antes del recorte. */
     const int32_t centred = (raw_q16 - dsp->dc_q16) >> Q16_SHIFT;
     int32_t       scaled  = centred * MIC_DSP_GAIN;
 

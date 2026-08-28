@@ -1,13 +1,13 @@
 /*
- * servo_map.h - Angle-to-PWM conversion for the volume servo of module E2.
+ * servo_map.h - Conversión de ángulo a PWM del servo de volumen del módulo E2.
  *
- * Pure integer maths, no ESP-IDF dependency, so it can be unit tested on the
- * host. The LEDC plumbing lives in servo.c.
+ * Aritmética entera pura, sin dependencias de ESP-IDF, para poder probarla en el
+ * host. El manejo de LEDC vive en servo.c.
  *
- * Context: the servo turns the potentiometer at the output of the audio
- * amplifier, which is how the remote user sets the volume. The backend sends
- * the position already expressed in degrees (finding M1), so this module only
- * has to bound it and turn it into a duty cycle.
+ * Contexto: el servo gira el potenciómetro a la salida del amplificador de
+ * audio, que es como el usuario remoto ajusta el volumen. El backend envía la
+ * posición ya expresada en grados (hallazgo M1), así que este módulo sólo tiene
+ * que acotarla y convertirla en ciclo de trabajo.
  */
 #pragma once
 
@@ -17,7 +17,8 @@
 extern "C" {
 #endif
 
-/* Standard hobby servo: 20 ms frame, 0.5-2.5 ms pulse over 0-180 degrees. */
+/* Servo estándar de aeromodelismo: trama de 20 ms y pulso de 0,5 a 2,5 ms para
+ * recorrer de 0 a 180 grados. */
 #define SERVO_FREQ_HZ       50
 #define SERVO_MIN_PULSE_US  500
 #define SERVO_MAX_PULSE_US  2500
@@ -25,23 +26,23 @@ extern "C" {
 #define SERVO_DUTY_RES_BITS 16
 
 /**
- * @brief Bound an angle to the servo's mechanical range.
+ * @brief Acota un ángulo al recorrido mecánico del servo.
  *
- * The Arduino build passed the backend value straight to Servo::write(), where
- * anything at or above 544 is reinterpreted as a pulse width in microseconds
- * rather than an angle -- a bad value would drive the servo into its end stop
- * (finding M1). Clamping here makes that impossible.
+ * La versión Arduino pasaba el valor del backend directo a Servo::write(), donde
+ * cualquier cifra de 544 en adelante se reinterpreta como ancho de pulso en
+ * microsegundos y no como ángulo: un valor malo empujaba el servo contra su tope
+ * (hallazgo M1). Acotar aquí lo vuelve imposible.
  */
 int servo_clamp_angle(int angle_deg);
 
 /**
- * @brief Duty cycle for an angle, at SERVO_DUTY_RES_BITS resolution.
+ * @brief Ciclo de trabajo de un ángulo, con resolución SERVO_DUTY_RES_BITS.
  *
- * duty = pulse_us * 2^bits * freq / 1e6. The angle is clamped first.
+ * duty = pulse_us * 2^bits * freq / 1e6. El ángulo se acota antes.
  */
 uint32_t servo_angle_to_duty(int angle_deg);
 
-/** @brief Pulse width in microseconds for an angle. Clamped. */
+/** @brief Ancho de pulso en microsegundos para un ángulo. Se acota. */
 uint32_t servo_angle_to_pulse_us(int angle_deg);
 
 #ifdef __cplusplus

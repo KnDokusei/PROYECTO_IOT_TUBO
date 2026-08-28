@@ -20,7 +20,7 @@ compilable y flasheable por separado.
 |---|---|---|---|
 | [E1-Mic](E1-Mic/) | DOIT DEVKIT V1 | Micrófono → WebSocket binario | ✅ **migrado** |
 | [E2-SineGen](E2-SineGen/) | DOIT DEVKIT V1 | AD9833 + servo | ✅ **migrado** |
-| [E3-StepMotor](E3-StepMotor/) | DOIT DEVKIT V1 | A4988 + fines de carrera | ⬜ esqueleto |
+| [E3-StepMotor](E3-StepMotor/) | DOIT DEVKIT V1 | A4988 + fines de carrera | ✅ **migrado** (autoprueba en placa; falta el motor real) |
 | [EC-Cameras](EC-Cameras/) | AI-Thinker ESP32-CAM | Servidor MJPEG ×3 | ⬜ esqueleto |
 
 Los cuatro módulos son **independientes entre sí**: no comparten pines ni
@@ -28,8 +28,10 @@ puertos, y cada uno puede migrarse o flashearse sin tocar los demás. Los
 esqueletos ya compilan y arrancan: inicializan NVS y avisan por consola de que
 su lógica todavía no está portada.
 
-Mientras tanto, el firmware operativo de E3 y EC sigue siendo el sketch de
-Arduino del proyecto original.
+Mientras tanto, el firmware operativo de EC sigue siendo el sketch de Arduino
+del proyecto original. E3 está migrado y su autoprueba de banco pasa entera
+(21/21), pero **todavía no se ha probado sobre el motor real**: hasta entonces,
+el sketch de Arduino sigue siendo el firmware de referencia para ese módulo.
 
 ## Estructura
 
@@ -46,7 +48,9 @@ E1-Mic/               proyecto IDF · migrado
 E2-SineGen/           proyecto IDF · migrado
   components/
     servo/                servo de volumen por LEDC (propio de E2)
-E3-StepMotor/         proyecto IDF · esqueleto
+E3-StepMotor/         proyecto IDF · migrado
+  components/
+    stepper/            A4988 por alarma de GPTimer (propio de E3)
 EC-Cameras/           proyecto IDF · esqueleto
 docs/                 documentación de migración y pruebas
 test/host/            tests sin hardware
@@ -89,9 +93,10 @@ Los símbolos de Kconfig están definidos una sola vez, en el componente
 ## Tests
 
 ```bash
-make -C test/host        # 277 checks (E1 + E2)
+make -C test/host        # 425 comprobaciones (E1 + E2 + E3)
 make -C test/host e1     # sólo E1: conversión de muestras
 make -C test/host e2     # sólo E2: DDS, servo y parseo de la API
+make -C test/host e3     # sólo E3: geometría del riel, acotado y unidades (A3)
 make -C test/host asan   # todos bajo AddressSanitizer + UBSan
 ```
 
@@ -109,6 +114,9 @@ python3 tools/ws_test_server.py --port 8081 --expect-hz 1200
 
 # E2/E3: sirve el contrato de la API y lo rompe a propósito
 python3 tools/http_test_server.py --port 5000
+
+# E3: barrido de posiciones del émbolo, y acepta su PUT de telemetría
+python3 tools/http_test_server.py --port 5000 --embolo
 ```
 
 El segundo recorre una secuencia de fases con 404, HTML de error, JSON truncado
@@ -125,6 +133,8 @@ GPIO34. Procedimientos completos en [docs/PRUEBAS-E1.md](docs/PRUEBAS-E1.md) y
   equivalentes, hallazgos cerrados y estado de verificación.
 - [docs/MIGRACION-E2.md](docs/MIGRACION-E2.md) — ídem para E2, con los detalles
   del AD9833 verificados contra su datasheet y los resultados en placa.
+- [docs/MIGRACION-E3.md](docs/MIGRACION-E3.md) — ídem para E3: por qué GPTimer y
+  no RMT, los ocho hallazgos cerrados y por qué A3 sigue abierto.
 - [docs/PRUEBAS-E2.md](docs/PRUEBAS-E2.md) — cómo validar E2 sin AD9833 ni
   servo.
 - [docs/PRUEBAS-E1.md](docs/PRUEBAS-E1.md) — cómo probar E1 aislado de los otros

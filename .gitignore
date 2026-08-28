@@ -6,6 +6,9 @@ managed_components/
 # WiFi credentials -- it must never be committed.
 sdkconfig
 sdkconfig.old
+# Variantes locales (sdkconfig.defaults.bench, .local...) suelen llevar
+# credenciales de una prueba concreta. sdkconfig.defaults SI se versiona.
+sdkconfig.defaults.*
 
 # NOTE: dependencies.lock IS committed on purpose. It pins the exact versions
 # resolved from the registry, which is what makes the build reproducible on
