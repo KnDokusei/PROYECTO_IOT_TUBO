@@ -134,3 +134,34 @@ GPIO34. Procedimientos completos en [docs/PRUEBAS-E1.md](docs/PRUEBAS-E1.md) y
 - [docs/ARQUITECTURA-FIRMWARE.html](docs/ARQUITECTURA-FIRMWARE.html) — explicación
   visual con diagramas de bloques: el sistema, los componentes y las cadenas de
   datos de E1 y E2. Se abre con doble clic; para PDF, imprimir desde el navegador.
+
+## Autoría y licencia
+
+Este repositorio es un **port a ESP-IDF** del firmware original desarrollado por
+**Jose Borquez Gaete** (agosto 2024) para el proyecto de actualización del
+Laboratorio Remoto — Tubo de Kundt, dirigido por el **Prof. Alfredo Navarro**,
+Universidad Técnica Federico Santa María.
+
+El diseño del experimento, los esquemáticos y la lógica de los cuatro módulos
+son obra suya. Este trabajo migra ese firmware a ESP-IDF conservando su
+comportamiento, y documenta las diferencias donde las hay.
+
+> **Licencia pendiente.** No se incluye archivo `LICENSE` a propósito: al
+> tratarse de un trabajo derivado, la licencia corresponde definirla al autor
+> original y al profesor a cargo. Hasta entonces, todos los derechos quedan
+> reservados y el código no debe redistribuirse sin su autorización.
+
+## Configuración local
+
+`sdkconfig` está en `.gitignore`, así que tras clonar hay que configurar cada
+módulo antes de compilar:
+
+```bash
+cd E1-Mic          # o el módulo que toque
+idf.py menuconfig  # → "Kundt tube configuration"
+idf.py build
+```
+
+Las credenciales WiFi y la IP del servidor se graban en NVS en el primer
+arranque. **Nunca se versionan.**
+
