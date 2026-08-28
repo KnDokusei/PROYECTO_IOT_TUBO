@@ -1,0 +1,19 @@
+# Target
+CONFIG_IDF_TARGET="esp32"
+
+# 4 MB flash on the DOIT DEVKIT V1
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# The streaming task must not be starved; keep both watchdogs on so a stall
+# is reported rather than silently degrading the audio.
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+
+# 44.1 kHz * 2 bytes = ~88 KiB/s sustained over TCP; give lwIP room so the
+# ADC pool does not overflow while the stack drains.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+
+# Keep the default log level informative but not chatty in the hot path.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

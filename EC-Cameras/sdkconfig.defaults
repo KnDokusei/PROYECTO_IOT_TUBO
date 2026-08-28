@@ -1,0 +1,9 @@
+# Target: AI-Thinker ESP32-CAM
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# The AI-Thinker ESP32-CAM carries 4 MB of PSRAM, which the camera driver needs
+# for anything above QVGA with two frame buffers.
+CONFIG_SPIRAM=y
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

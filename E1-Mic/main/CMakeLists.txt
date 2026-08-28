@@ -1,0 +1,8 @@
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    REQUIRES kundt_config kundt_wifi kundt_led mic_capture esp_timer esp_driver_dac esp_driver_gpio
+)
+
+# Treat warnings as errors in our own code (not in IDF/managed components).
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)

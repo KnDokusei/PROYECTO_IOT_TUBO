@@ -1,0 +1,27 @@
+# ESP-IDF build artifacts
+build/
+managed_components/
+
+# sdkconfig is generated from sdkconfig.defaults + Kconfig and holds the local
+# WiFi credentials -- it must never be committed.
+sdkconfig
+sdkconfig.old
+
+# NOTE: dependencies.lock IS committed on purpose. It pins the exact versions
+# resolved from the registry, which is what makes the build reproducible on
+# another machine -- the gap the Arduino build never closed.
+
+# Host test artifacts
+test/host/build/
+*.o
+*.out
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+e1_capture*.wav

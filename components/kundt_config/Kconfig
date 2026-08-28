@@ -1,0 +1,37 @@
+menu "Kundt tube configuration"
+
+    # Defined here, in the shared component, so all four modules inherit the
+    # same symbols instead of each carrying its own copy.
+
+    comment "First-boot defaults. Values are copied into NVS on first boot and"
+    comment "can be changed at runtime afterwards without rebuilding."
+
+    config KUNDT_DEFAULT_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            Leave empty in the repository. Set it locally with menuconfig;
+            sdkconfig is git-ignored, so the credential is never committed.
+
+    config KUNDT_DEFAULT_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+        help
+            As above: configure locally, never commit.
+
+    config KUNDT_DEFAULT_SERVER_IP
+        string "Server IPv4 address"
+        default "192.168.0.100"
+        help
+            Host running the Kundt lab backend. The WebSocket port is derived
+            from the kit number as 8080 + kit.
+
+    config KUNDT_DEFAULT_KIT
+        int "Kit number"
+        range 1 5
+        default 1
+        help
+            Identifies this rig (1..5). Selects the WebSocket port: kit 1 uses
+            8081, kit 5 uses 8085.
+
+endmenu
