@@ -52,7 +52,6 @@ E3-StepMotor/         proyecto IDF · migrado
   components/
     stepper/            A4988 por alarma de GPTimer (propio de E3)
 EC-Cameras/           proyecto IDF · esqueleto
-docs/                 documentación de migración y pruebas
 test/host/            tests sin hardware
 tools/                bancos de pruebas (WebSocket para E1, HTTP para E2/E3)
 ```
@@ -124,26 +123,13 @@ y valores fuera de rango, para comprobar en hardware que el firmware **mantiene
 el último valor válido** en vez de caer a cero.
 
 Ambos módulos se validan en una ESP32 pelada con un solo puente entre GPIO25 y
-GPIO34. Procedimientos completos en [docs/PRUEBAS-E1.md](docs/PRUEBAS-E1.md) y
-[docs/PRUEBAS-E2.md](docs/PRUEBAS-E2.md).
+GPIO34.
 
 ## Documentación
 
-- [docs/MIGRACION-E1.md](docs/MIGRACION-E1.md) — análisis de librerías
-  equivalentes, hallazgos cerrados y estado de verificación.
-- [docs/MIGRACION-E2.md](docs/MIGRACION-E2.md) — ídem para E2, con los detalles
-  del AD9833 verificados contra su datasheet y los resultados en placa.
-- [docs/MIGRACION-E3.md](docs/MIGRACION-E3.md) — ídem para E3: por qué GPTimer y
-  no RMT, los ocho hallazgos cerrados y por qué A3 sigue abierto.
-- [docs/PRUEBAS-E2.md](docs/PRUEBAS-E2.md) — cómo validar E2 sin AD9833 ni
-  servo.
-- [docs/PRUEBAS-E1.md](docs/PRUEBAS-E1.md) — cómo probar E1 aislado de los otros
-  tres módulos, en cuatro niveles.
-- [docs/INTEGRACION.md](docs/INTEGRACION.md) — si E1 y E2 están listos para el
-  equipo real, checklist previo a instalar y riesgos residuales.
-- [docs/ARQUITECTURA-FIRMWARE.html](docs/ARQUITECTURA-FIRMWARE.html) — explicación
-  visual con diagramas de bloques: el sistema, los componentes y las cadenas de
-  datos de E1 y E2. Se abre con doble clic; para PDF, imprimir desde el navegador.
+El análisis de la migración módulo a módulo, los procedimientos de prueba y el
+checklist previo a instalar se mantienen **fuera de este repositorio**, junto al
+resto de la documentación del proyecto.
 
 ## Autoría y licencia
 

@@ -28,3 +28,6 @@ test/host/build/
 __pycache__/
 *.pyc
 e1_capture*.wav
+
+# La documentación de análisis se mantiene sólo en local, fuera de GitHub.
+docs/
