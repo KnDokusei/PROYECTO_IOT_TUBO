@@ -18,6 +18,8 @@ static const char *TAG = "kundt_config";
 #define KEY_PASSWORD  "pass"
 #define KEY_SERVER_IP "srv_ip"
 #define KEY_KIT       "kit"
+#define KEY_PLATFORM  "plat"
+#define KEY_CONTROLLER "ctrl"
 
 static kundt_config_t s_cfg;
 static bool           s_loaded;
@@ -92,12 +94,15 @@ esp_err_t kundt_config_init(void)
         copy_bounded(s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), CONFIG_KUNDT_DEFAULT_WIFI_SSID);
         copy_bounded(s_cfg.wifi_password, sizeof(s_cfg.wifi_password), CONFIG_KUNDT_DEFAULT_WIFI_PASSWORD);
         copy_bounded(s_cfg.server_ip, sizeof(s_cfg.server_ip), CONFIG_KUNDT_DEFAULT_SERVER_IP);
-        s_cfg.kit = CONFIG_KUNDT_DEFAULT_KIT;
+        s_cfg.kit           = CONFIG_KUNDT_DEFAULT_KIT;
+        s_cfg.platform_id   = CONFIG_KUNDT_DEFAULT_PLATFORM_ID;
+        s_cfg.controller_id = CONFIG_KUNDT_DEFAULT_CONTROLLER_ID;
         s_loaded  = true;
 
         kundt_config_set_wifi(s_cfg.wifi_ssid, s_cfg.wifi_password);
         kundt_config_set_server_ip(s_cfg.server_ip);
         kundt_config_set_kit(s_cfg.kit);
+        kundt_config_set_ids(s_cfg.platform_id, s_cfg.controller_id);
         return ESP_OK;
     }
     if (err != ESP_OK) {
@@ -117,6 +122,15 @@ esp_err_t kundt_config_init(void)
         kit = CONFIG_KUNDT_DEFAULT_KIT;
     }
     s_cfg.kit = kit;
+
+    /* Un cero guardado no es un id válido: se trata como ausente y se recurre
+     * al valor de compilación, igual que hace el kit. */
+    uint8_t id = 0;
+    s_cfg.platform_id   = (nvs_get_u8(h, KEY_PLATFORM,   &id) == ESP_OK && id != 0)
+                          ? id : CONFIG_KUNDT_DEFAULT_PLATFORM_ID;
+    id = 0;
+    s_cfg.controller_id = (nvs_get_u8(h, KEY_CONTROLLER, &id) == ESP_OK && id != 0)
+                          ? id : CONFIG_KUNDT_DEFAULT_CONTROLLER_ID;
 
     nvs_close(h);
     s_loaded = true;
@@ -189,6 +203,46 @@ uint16_t kundt_config_ws_port(void)
     return (uint16_t)(KUNDT_WS_PORT_BASE + s_cfg.kit);
 }
 
+esp_err_t kundt_config_set_ids(uint8_t platform_id, uint8_t controller_id)
+{
+    if (platform_id == 0 || controller_id == 0) {
+        ESP_LOGE(TAG, "platform_id y controller_id deben ser distintos de cero");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_cfg.platform_id   = platform_id;
+    s_cfg.controller_id = controller_id;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, KEY_PLATFORM, platform_id);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, KEY_CONTROLLER, controller_id);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t kundt_config_broker_uri(char *buf, size_t buf_len)
+{
+    if (buf == NULL || buf_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int n = snprintf(buf, buf_len, "mqtt://%s:%u",
+                           s_cfg.server_ip, (unsigned)KUNDT_MQTT_PORT);
+    if (n < 0 || (size_t)n >= buf_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
 esp_err_t kundt_config_ws_uri(char *buf, size_t buf_len)
 {
     if (buf == NULL || buf_len == 0) {
@@ -216,4 +270,7 @@ void kundt_config_log(void)
              s_cfg.server_ip,
              (unsigned)kundt_config_ws_port());
     ESP_LOGI(TAG, "contraseña: %s", s_cfg.wifi_password[0] ? "<definida>" : "<vacía>");
+    ESP_LOGI(TAG, "curiousBeagle: platform=%u controller=%u  ->  kundt/%u/%u",
+             (unsigned)s_cfg.platform_id, (unsigned)s_cfg.controller_id,
+             (unsigned)s_cfg.platform_id, (unsigned)s_cfg.controller_id);
 }

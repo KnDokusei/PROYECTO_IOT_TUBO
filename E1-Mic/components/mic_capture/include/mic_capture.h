@@ -51,10 +51,15 @@ typedef struct {
  * eso ocurra, los pasajes fuertes empujan la entrada fuera de rango y saturan.
  * Es una limitación del lado analógico: el firmware no puede corregirla.
  */
+/* Frecuencia de muestreo nominal. Con nombre para que quien afine el Goertzel
+ * use el mismo valor que el driver y no una constante duplicada que se
+ * desincronice al cambiar la configuración. */
+#define MIC_SAMPLE_RATE_HZ 44100
+
 #define MIC_CAPTURE_DEFAULT_CONFIG()             \
     (mic_capture_config_t)                       \
     {                                            \
-        .sample_rate_hz = 44100,                 \
+        .sample_rate_hz = MIC_SAMPLE_RATE_HZ,                 \
         .frame_samples  = 512,                   \
         .frame_count    = 10,                    \
         .adc_channel    = ADC_CHANNEL_6,         \

@@ -5,6 +5,8 @@
  * firmware como en los tests de host.
  */
 
+#include <math.h>
+
 #include "mic_dsp.h"
 
 /* El offset se lleva en punto fijo Q16.16 para que un suavizado de hasta 30
@@ -136,4 +138,102 @@ void mic_dsp_analyze(const int16_t *pcm, size_t n, mic_pcm_stats_t *out)
     out->max = hi;
     out->sum_sq = acc;
     out->n = n;
+}
+
+/* ---------------------------------------------------------------------
+ * Goertzel
+ * --------------------------------------------------------------------- */
+
+/* Con -std=c11 no se expone M_PI: es una extensión X/Open, no C estándar. */
+#ifndef MIC_PI
+#define MIC_PI 3.14159265358979323846f
+#endif
+
+/* Por debajo de unas pocas muestras la recurrencia no llega a formar la
+ * ventana y el resultado no significa nada. */
+#define MIC_GOERTZEL_WINDOW_MIN 8u
+
+void mic_goertzel_init(mic_goertzel_t *g, float freq_hz, float sample_hz, size_t window)
+{
+    if (g == NULL) {
+        return;
+    }
+
+    if (window < MIC_GOERTZEL_WINDOW_MIN) {
+        window = MIC_GOERTZEL_WINDOW_MIN;
+    }
+
+    /* Fuera de [0, fs/2] no hay nada que medir: por encima de Nyquist la
+     * frecuencia se pliega y el resultado mediría otra cosa sin avisar. */
+    if (!(sample_hz > 0.0f)) {
+        sample_hz = 1.0f;
+    }
+    if (freq_hz < 0.0f) {
+        freq_hz = 0.0f;
+    }
+    const float nyquist = sample_hz * 0.5f;
+    if (freq_hz > nyquist) {
+        freq_hz = nyquist;
+    }
+
+    /* El índice de bin puede ser fraccionario: no se redondea a propósito.
+     * Redondear desplazaría el punto evaluado hasta medio bin y restaría
+     * hasta 3,9 dB por pérdida de festoneado justo en la medida que importa. */
+    g->coeff  = 2.0f * cosf(2.0f * MIC_PI * freq_hz / sample_hz);
+    g->window = window;
+    mic_goertzel_reset(g);
+}
+
+void mic_goertzel_reset(mic_goertzel_t *g)
+{
+    if (g == NULL) {
+        return;
+    }
+    g->s1 = 0.0f;
+    g->s2 = 0.0f;
+    g->n  = 0;
+}
+
+void mic_goertzel_push_block(mic_goertzel_t *g, const int16_t *pcm, size_t n)
+{
+    if (g == NULL || pcm == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        mic_goertzel_push(g, pcm[i]);
+    }
+}
+
+float mic_goertzel_rms(const mic_goertzel_t *g)
+{
+    if (g == NULL || g->n == 0) {
+        return 0.0f;
+    }
+
+    /* |X|^2 = s1^2 + s2^2 - coeff*s1*s2. La identidad no supone que el índice
+     * de bin sea entero, así que vale igual para frecuencias arbitrarias. */
+    float power = g->s1 * g->s1 + g->s2 * g->s2 - g->coeff * g->s1 * g->s2;
+
+    /* La resta puede dar un negativo diminuto por redondeo cuando la señal es
+     * casi nula. Recortar a cero evita un NaN en la raíz. */
+    if (power < 0.0f) {
+        power = 0.0f;
+    }
+
+    /* Para x[n] = A*sin(...) resulta |X| = A*N/2, luego A = 2|X|/N y el valor
+     * eficaz es A/raiz(2) = |X|*raiz(2)/N. Con esa normalización el resultado
+     * queda en las mismas cuentas de PCM que sqrt(sum_sq/n) de mic_dsp_analyze,
+     * y los dos números se pueden comparar directamente.
+     *
+     * Se normaliza por las muestras acumuladas, no por la ventana nominal, para
+     * que una ventana incompleta siga dando una amplitud con sentido. */
+    return sqrtf(power) * 1.41421356f / (float)g->n;
+}
+
+float mic_goertzel_block(const int16_t *pcm, size_t n, float freq_hz, float sample_hz)
+{
+    mic_goertzel_t g;
+    mic_goertzel_init(&g, freq_hz, sample_hz, n);
+    mic_goertzel_push_block(&g, pcm, n);
+    return mic_goertzel_rms(&g);
 }

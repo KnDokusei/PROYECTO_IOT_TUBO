@@ -1,19 +1,29 @@
 /*
  * E1-Mic - Módulo de micrófono del tubo de Kundt, port a ESP-IDF.
  *
- * Función (según el README del proyecto): escuchar con el micrófono fijo en la
- * entrada del tubo el audio que el módulo de parlante (E2) inyecta, y enviarlo
- * al servidor por un WebSocket binario, para que el usuario remoto oiga la onda
- * estacionaria mientras el émbolo barre la longitud.
+ * Función: escuchar con el micrófono fijo en la entrada del tubo el audio que
+ * el módulo de parlante (E2) inyecta, y reportar al servidor la AMPLITUD de la
+ * onda estacionaria mientras el émbolo barre la longitud.
  *
  * Cadena de señal: micrófono electret -> preamplificador -> LM324 -> GPIO34
  *                  (ADC1_CH6) -> SAR ADC en modo continuo por DMA -> PCM16
- *                  -> WebSocket.
+ *                  -> Goertzel -> MQTT.
+ *
+ * El módulo ya no manda audio. El experimento mide amplitud contra posición del
+ * émbolo, y eso es un escalar por ventana, no una forma de onda: 160 B/s en vez
+ * de 93 KiB/s. Además, el valor que se publica es la componente en la frecuencia
+ * que fija E2, no el nivel de banda ancha, así que el motor paso a paso, los
+ * ventiladores y el rizado de la fuente quedan fuera de la medida.
+ *
+ * El WebSocket de audio crudo sigue existiendo tras CONFIG_E1_DEBUG_STREAM,
+ * apagado por defecto, porque es la única forma de mirar la forma de onda del
+ * frente analógico desde el PC.
  *
  * Portado del sketch de Arduino, que usaba el modo ADC interno del driver I2S
  * antiguo, hoy inexistente en ESP-IDF. Ver MIGRACION-E1.md.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -21,9 +31,12 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#if CONFIG_E1_DEBUG_STREAM
+#include "esp_websocket_client.h"
+#endif
 
 #if CONFIG_E1_SELFTEST_DAC
 #include "driver/dac_cosine.h"
@@ -31,15 +44,20 @@
 
 #include "kundt_config.h"
 #include "kundt_led.h"
+#include "kundt_mqtt.h"
 #include "kundt_wifi.h"
 #include "mic_capture.h"
+#include "mic_dsp.h"
 
 static const char *TAG = "E1-Mic";
 
-/* Un bloque PCM por trama de WebSocket. Coincide con el tamaño de trama del DMA
- * para que cada lectura sea exactamente un envío: 512 muestras = 1024 bytes,
- * ~86 tramas/s a 44,1 kHz. */
+/* Tamaño de bloque de lectura. Coincide con la trama del DMA para que cada
+ * lectura sea exactamente una trama: 512 muestras, ~86 bloques/s a 44,1 kHz. */
 #define PCM_BLOCK_SAMPLES 512
+
+/* Frecuencia de arranque del Goertzel. La misma con la que parte el AD9833 de
+ * E2, para que la medida tenga sentido antes de recibir la primera consigna. */
+#define DEFAULT_TONE_HZ 1200
 
 /* Suficientemente largo para que un tubo en silencio no llene el log de
  * timeouts, y suficientemente corto para notar pronto un ADC detenido. */
@@ -48,9 +66,34 @@ static const char *TAG = "E1-Mic";
 /* Cadencia del log de avance. */
 #define STATS_INTERVAL_MS 10000
 
+#if CONFIG_E1_DEBUG_STREAM
 static esp_websocket_client_handle_t s_ws;
-static int16_t                       s_pcm[PCM_BLOCK_SAMPLES];
+#endif
+static int16_t s_pcm[PCM_BLOCK_SAMPLES];
 
+/*
+ * Estado de la medida. El Goertzel y los acumuladores de ventana los toca sólo
+ * la tarea de captura; s_tone_hz lo escribe el callback de MQTT, que corre en
+ * otra tarea, de ahí el volatile. Se lee al cerrar cada ventana, así que un
+ * cambio a mitad no parte la medida en dos frecuencias.
+ */
+static mic_goertzel_t   s_gz;
+static volatile int32_t s_tone_hz = DEFAULT_TONE_HZ;
+static uint64_t         s_win_sumsq;
+static int32_t          s_win_peak;
+
+/* La consigna llega por el mismo tópico que la de E2: los tres módulos comparten
+ * controlador y cada uno se queda con los campos que le tocan. E1 sólo necesita
+ * saber a qué frecuencia mirar. */
+static void on_actuators(const kundt_mqtt_actuators_t *act, void *ctx)
+{
+    (void)ctx;
+    if (act->has_frequency && act->frequency > 0) {
+        s_tone_hz = act->frequency;
+    }
+}
+
+#if CONFIG_E1_DEBUG_STREAM
 static void ws_event_handler(void            *arg,
                              esp_event_base_t base,
                              int32_t          id,
@@ -108,6 +151,7 @@ static esp_err_t websocket_start(void)
 
     return esp_websocket_client_start(s_ws);
 }
+#endif /* CONFIG_E1_DEBUG_STREAM */
 
 #if CONFIG_E1_SELFTEST_DAC
 /*
@@ -185,10 +229,15 @@ static void mic_stream_task(void *arg)
     (void)arg;
 
     int64_t  last_stats = 0;
+    uint32_t windows = 0;
+    float    last_amp = 0.0f, last_rms = 0.0f;
+    int32_t  tuned_hz = 0;
+#if CONFIG_E1_DEBUG_STREAM
     uint64_t sent_bytes = 0;
     uint32_t send_fails = 0;
+#endif
 
-    ESP_LOGI(TAG, "tarea de streaming iniciada en el núcleo %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "tarea de medida iniciada en el núcleo %d", xPortGetCoreID());
 
     for (;;) {
         size_t    samples = 0;
@@ -217,9 +266,12 @@ static void mic_stream_task(void *arg)
         }
 #endif
 
+#if CONFIG_E1_DEBUG_STREAM
         /* Con el enlace caído se descarta el audio en vez de bloquear la cadena
          * del ADC: el tubo sigue funcionando y el audio viejo no le sirve a
-         * nadie. */
+         * nadie. Aun así este envío puede bloquear por tiempo de aire y
+         * desbordar el pool del ADC; por eso la compilación de producción no lo
+         * lleva. */
         if (esp_websocket_client_is_connected(s_ws)) {
             const int bytes = (int)(samples * sizeof(int16_t));
             const int wrote  = esp_websocket_client_send_bin(
@@ -231,11 +283,59 @@ static void mic_stream_task(void *arg)
                 sent_bytes += (uint64_t)wrote;
             }
         }
+#endif
 
-        kundt_led_set_state(!kundt_wifi_is_connected()   ? KUNDT_LED_NO_WIFI
-                            : esp_websocket_client_is_connected(s_ws)
-                                                            ? KUNDT_LED_RUNNING
-                                                            : KUNDT_LED_NO_SERVER);
+        /* --- medida ------------------------------------------------------ */
+
+        /* Reafinar sólo entre ventanas: cambiar el coeficiente a media
+         * acumulación mezclaría dos frecuencias en un mismo resultado. */
+        if (tuned_hz != s_tone_hz) {
+            tuned_hz = s_tone_hz;
+            mic_goertzel_init(&s_gz, (float)tuned_hz, (float)MIC_SAMPLE_RATE_HZ,
+                              CONFIG_E1_GOERTZEL_WINDOW);
+            s_win_sumsq = 0;
+            s_win_peak  = 0;
+            ESP_LOGI(TAG, "midiendo a %ld Hz", (long)tuned_hz);
+        }
+
+        mic_pcm_stats_t bs;
+        mic_dsp_analyze(s_pcm, samples, &bs);
+        s_win_sumsq += bs.sum_sq;
+
+        /* El pico se toma en valor absoluto: la saturación aparece igual por
+         * arriba que por abajo, y -INT16_MIN no cabe en int16. */
+        const int32_t hi = bs.max;
+        const int32_t lo = -(int32_t)bs.min;
+        const int32_t pk = (hi > lo) ? hi : lo;
+        if (pk > s_win_peak) {
+            s_win_peak = pk;
+        }
+
+        mic_goertzel_push_block(&s_gz, s_pcm, samples);
+
+        if (mic_goertzel_ready(&s_gz)) {
+            const size_t n = s_gz.n;
+            last_amp = mic_goertzel_rms(&s_gz);
+            last_rms = sqrtf((float)s_win_sumsq / (float)n);
+            windows++;
+
+            const kundt_mqtt_sensors_t m = {
+                .mic_amplitude = last_amp, .has_mic_amplitude = true,
+                .mic_rms       = last_rms, .has_mic_rms       = true,
+                .mic_peak      = s_win_peak, .has_mic_peak    = true,
+            };
+            /* Un fallo no se reintenta: la ventana siguiente llega en ~93 ms y
+             * al servidor le sirve el valor de ese momento, no el de antes. */
+            kundt_mqtt_publish(&m, NULL);
+
+            mic_goertzel_reset(&s_gz);
+            s_win_sumsq = 0;
+            s_win_peak  = 0;
+        }
+
+        kundt_led_set_state(!kundt_wifi_is_connected() ? KUNDT_LED_NO_WIFI
+                            : kundt_mqtt_is_connected() ? KUNDT_LED_RUNNING
+                                                        : KUNDT_LED_NO_SERVER);
 
         const int64_t now = esp_timer_get_time() / 1000;
         if (now - last_stats >= STATS_INTERVAL_MS) {
@@ -254,12 +354,21 @@ static void mic_stream_task(void *arg)
                      (unsigned long long)st.words_dropped,
                      (unsigned long)st.pool_overflows);
             ESP_LOGI(TAG,
-                     "RED  wifi=%s(%lu caídas) ws=%s enviado=%lluKiB fallos=%lu",
+                     "MED  %ld Hz  amplitud=%.1f rms=%.1f pico=%ld  ventanas=%lu",
+                     (long)tuned_hz, (double)last_amp, (double)last_rms,
+                     (long)s_win_peak, (unsigned long)windows);
+            ESP_LOGI(TAG,
+                     "RED  wifi=%s(%lu caídas) mqtt=%s publicados=%lu recibidos=%lu",
                      kundt_wifi_ip(),
                      (unsigned long)kundt_wifi_disconnect_count(),
-                     esp_websocket_client_is_connected(s_ws) ? "arriba" : "abajo",
+                     kundt_mqtt_is_connected() ? "arriba" : "abajo",
+                     (unsigned long)kundt_mqtt_published(),
+                     (unsigned long)kundt_mqtt_received());
+#if CONFIG_E1_DEBUG_STREAM
+            ESP_LOGI(TAG, "WS   enviado=%lluKiB fallos=%lu",
                      (unsigned long long)(sent_bytes / 1024),
                      (unsigned long)send_fails);
+#endif
             /* El heap es la cifra que delata una fuga en la cadena de envío:
              * una caída lenta a lo largo de horas es lo que deja el equipo del
              * laboratorio fuera de servicio. */
@@ -301,7 +410,22 @@ void app_main(void)
         ESP_LOGW(TAG, "sin WiFi tras 30 s; se continúa (los reintentos siguen en segundo plano)");
     }
 
+    /* El cliente MQTT reintenta por su cuenta, así que se arranca sin esperar
+     * más: si el broker aún no está levantado, se conectará cuando lo esté. */
+    char broker[48];
+    ESP_ERROR_CHECK(kundt_config_broker_uri(broker, sizeof(broker)));
+    ESP_ERROR_CHECK(kundt_mqtt_start(broker, cfg.platform_id, cfg.controller_id,
+                                     on_actuators, NULL));
+
+#if CONFIG_E1_DEBUG_STREAM
+    ESP_LOGW(TAG, "COMPILACIÓN DE DEPURACIÓN: el WebSocket de audio crudo está activo");
     ESP_ERROR_CHECK(websocket_start());
+#endif
+
+    /* Se afina con la frecuencia de arranque de E2; la primera consigna que
+     * llegue por MQTT la corrige. */
+    mic_goertzel_init(&s_gz, (float)DEFAULT_TONE_HZ, (float)MIC_SAMPLE_RATE_HZ,
+                      CONFIG_E1_GOERTZEL_WINDOW);
 
 #if CONFIG_E1_SELFTEST_DAC
     kundt_led_mark_selftest();
@@ -311,6 +435,6 @@ void app_main(void)
     const mic_capture_config_t mic_cfg = MIC_CAPTURE_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(mic_capture_start(&mic_cfg));
 
-    /* El núcleo 1 mantiene la cadena de envío fuera del 0, donde corre WiFi. */
-    xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 1);
+    /* El núcleo 1 mantiene la cadena de medida fuera del 0, donde corre WiFi. */
+    xTaskCreatePinnedToCore(mic_stream_task, "mic_meas", 4096, NULL, 5, NULL, 1);
 }

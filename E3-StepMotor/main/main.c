@@ -5,8 +5,8 @@
  * posición que pide el servidor, respetando los dos fines de carrera, e
  * informar de vuelta la posición real para que el usuario remoto la vea.
  *
- * Cadena de control: GET posición deseada -> pasos -> A4988 -> motor -> riel,
- *                    y PUT de la posición alcanzada.
+ * Cadena de control: consigna por MQTT -> pasos -> A4988 -> motor -> riel,
+ *                    y publicación de la posición alcanzada y los topes.
  *
  * Portado del sketch de Arduino. Se conservan las funcionalidades; se corrigen
  * los hallazgos de la auditoría que el port permite cerrar, cada uno marcado
@@ -20,20 +20,24 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "kundt_api.h"
+#include "freertos/queue.h"
+
 #include "kundt_config.h"
 #include "kundt_led.h"
+#include "kundt_mqtt.h"
 #include "kundt_wifi.h"
 #include "selftest.h"
 #include "stepper.h"
 
 static const char *TAG = "E3-StepMotor";
 
-/* El sketch original consultaba cada 500 ms (API_CALL_DELAY_MS). Se mantiene. */
-#define POLL_INTERVAL_MS 500
-
-/* Puerto del backend para la API de valores. */
-#define API_PORT 5000
+/*
+ * Ya no hay sondeo: la consigna llega empujada por MQTT. Este intervalo es el
+ * ritmo con que se revisa el estado del motor y se informa la posición, y se
+ * mantiene en los 500 ms del sketch original porque marca la resolución
+ * temporal con que el usuario remoto ve avanzar el émbolo.
+ */
+#define TICK_INTERVAL_MS 500
 
 /* Cadencia del log de avance. */
 #define STATS_INTERVAL_MS 15000
@@ -44,6 +48,22 @@ static const char *TAG = "E3-StepMotor";
 #define EMBOLO_UNIT STEPPER_INPUT_MM
 #endif
 
+/*
+ * Cola de una entrada, sobrescribible. El callback de MQTT corre en la tarea de
+ * eventos del cliente y mover el motor puede tardar segundos, así que aquí sólo
+ * se anota el destino. Si llegan varios mientras el émbolo se desplaza, el que
+ * vale es el último: encolarlos todos haría recorrer posiciones que nadie pidió.
+ */
+static QueueHandle_t s_cmd_queue;
+
+static void on_actuators(const kundt_mqtt_actuators_t *act, void *ctx)
+{
+    (void)ctx;
+    if (act->has_plunger_pos) {
+        xQueueOverwrite(s_cmd_queue, act);
+    }
+}
+
 static void control_task(void *arg)
 {
     (void)arg;
@@ -51,16 +71,21 @@ static void control_task(void *arg)
     int32_t  last_target = INT32_MIN;
     int32_t  last_warned = INT32_MIN; /* evita repetir el aviso de acotado */
     bool     was_moving  = false;
-    uint32_t ok = 0, failed = 0, put_failed = 0;
+    uint32_t applied = 0, pub_failed = 0;
     int64_t  last_stats = 0;
 
-    ESP_LOGI(TAG, "lazo de control iniciado (consulta cada %d ms)", POLL_INTERVAL_MS);
+    ESP_LOGI(TAG, "lazo de control iniciado (tick de %d ms)", TICK_INTERVAL_MS);
 
     for (;;) {
-        /* Espera real, no `continue` en seco. El sketch original giraba a 100 %
-         * de CPU en el núcleo 0 durante los 500 ms de espera, dejando hambrienta
-         * a la tarea IDLE que alimenta el watchdog (hallazgo M3). */
-        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+        kundt_mqtt_actuators_t cmd;
+
+        /* Se espera con tiempo límite en vez de dormir en seco: una consigna se
+         * atiende al instante y el vencimiento marca el ritmo del reporte. El
+         * sketch original giraba a 100 % de CPU en el núcleo 0 durante estos
+         * 500 ms, dejando hambrienta a la tarea IDLE que alimenta el watchdog
+         * (hallazgo M3). */
+        const bool got = xQueueReceive(s_cmd_queue, &cmd,
+                                       pdMS_TO_TICKS(TICK_INTERVAL_MS)) == pdTRUE;
 
         if (!kundt_wifi_is_connected()) {
             /* El README promete que el motor se detiene mientras no haya red. */
@@ -71,35 +96,25 @@ static void control_task(void *arg)
             kundt_led_set_state(KUNDT_LED_NO_WIFI);
             continue;
         }
-
-        kundt_valores_t v;
-        const esp_err_t err = kundt_api_get_valores(&v);
-        if (err != ESP_OK) {
-            failed++;
+        if (!kundt_mqtt_is_connected()) {
+            /* Se conserva la última consigna en vez de caer a cero, que es lo
+             * que hacía la versión Arduino ante un 404 o un JSON ilegible
+             * (hallazgo A4). Aquí caer a cero mandaría el émbolo contra el
+             * tope. El motor sigue hacia donde iba: perder el broker no es
+             * perder la red, y detenerse a media carrera deja el émbolo en una
+             * posición que nadie pidió. */
             kundt_led_set_state(KUNDT_LED_NO_SERVER);
-            /* Se conserva la última consigna válida en vez de caer a cero, que
-             * es lo que hacía la versión Arduino ante un 404 o un JSON ilegible
-             * (hallazgo A4). Aquí caer a cero significaría mandar el émbolo
-             * contra el tope. */
-            if (failed % 20 == 1) {
-                /* Antes de la primera consigna válida no hay nada que mantener:
-                 * imprimir last_target daría INT32_MIN convertido a cm. */
-                if (last_target == INT32_MIN) {
-                    ESP_LOGW(TAG, "el GET falló (%s); aún sin consigna del servidor",
-                             esp_err_to_name(err));
-                } else {
-                    ESP_LOGW(TAG, "el GET falló (%s); se mantiene la consigna (%.2f cm)",
-                             esp_err_to_name(err),
-                             (double)stepper_steps_to_cm(last_target));
-                }
-            }
             continue;
         }
-        ok++;
+
         kundt_led_set_state(KUNDT_LED_RUNNING);
 
-        if (v.has_embolo) {
-            const float   want_cm = stepper_input_to_cm(v.embolo, EMBOLO_UNIT);
+        if (got) {
+            /* El contrato de curiousBeagle fija plunger_pos en centímetros, y
+             * queda escrito en el DTO del servidor. Esa es la diferencia con el
+             * hallazgo A3: el servidor viejo nunca documentó la unidad, y aquí
+             * no hay nada que deducir. */
+            const float   want_cm = cmd.plunger_pos;
             const int32_t want    = stepper_clamp_steps(stepper_cm_to_steps(want_cm),
                                                         stepper_neg_limit_steps(),
                                                         stepper_pos_limit_steps());
@@ -121,6 +136,7 @@ static void control_task(void *arg)
                              (double)stepper_steps_to_cm(want), (long)want,
                              (double)stepper_steps_to_cm(stepper_position()));
                     last_target = want;
+                    applied++;
                 }
             }
         }
@@ -137,10 +153,16 @@ static void control_task(void *arg)
          * que los 0,1 cm que promete el README (hallazgo A2).
          */
         const bool moving = stepper_is_moving();
-        if (moving || was_moving) {
-            const float pos_cm = stepper_steps_to_cm(stepper_position());
-            if (kundt_api_put_posicion(pos_cm) != ESP_OK) {
-                put_failed++;
+        if (moving || was_moving || got) {
+            const stepper_endstops_t now_es = stepper_read_endstops();
+            const kundt_mqtt_sensors_t m = {
+                .plunger_actual   = stepper_steps_to_cm(stepper_position()),
+                .has_plunger_actual = true,
+                .clockwise_limit  = now_es.pos_pressed, .has_clockwise_limit = true,
+                .counter_limit    = now_es.neg_pressed, .has_counter_limit   = true,
+            };
+            if (kundt_mqtt_publish(&m, NULL) != ESP_OK) {
+                pub_failed++;
             }
         }
         was_moving = moving;
@@ -159,9 +181,11 @@ static void control_task(void *arg)
                      st.moving ? "en marcha" : "detenido",
                      (unsigned long long)st.steps_emitted,
                      (unsigned long)st.endstop_stops);
-            ESP_LOGI(TAG, "RED  consultas ok=%lu fallidas=%lu put_fallidos=%lu wifi=%s",
-                     (unsigned long)ok, (unsigned long)failed,
-                     (unsigned long)put_failed, kundt_wifi_ip());
+            ESP_LOGI(TAG, "RED  consignas=%lu aplicadas=%lu publicados=%lu fallidos=%lu wifi=%s mqtt=%s",
+                     (unsigned long)kundt_mqtt_received(), (unsigned long)applied,
+                     (unsigned long)kundt_mqtt_published(), (unsigned long)pub_failed,
+                     kundt_wifi_ip(),
+                     kundt_mqtt_is_connected() ? "arriba" : "abajo");
             ESP_LOGI(TAG, "FIN  carrera -: %s   carrera +: %s   calibrado: %s",
                      es.neg_pressed ? "PULSADO" : "libre",
                      es.pos_pressed ? "PULSADO" : "libre",
@@ -190,8 +214,10 @@ void app_main(void)
     kundt_config_t cfg;
     ESP_ERROR_CHECK(kundt_config_get(&cfg));
 
-    ESP_LOGI(TAG, "unidad supuesta para 'embolo': %s (hallazgo A3)",
-             EMBOLO_UNIT == STEPPER_INPUT_MM ? "milímetros" : "centímetros");
+    /* Con MQTT la unidad la fija el DTO de curiousBeagle: plunger_pos va en
+     * centímetros. EMBOLO_UNIT sólo sigue existiendo para las pruebas de host
+     * que ejercitan la conversión del contrato viejo. */
+    ESP_LOGI(TAG, "consignas en centímetros, según el DTO de curiousBeagle");
 
     stepper_config_t st_cfg  = STEPPER_DEFAULT_CONFIG();
     st_cfg.speed_sps         = CONFIG_E3_SPEED_SPS;
@@ -212,10 +238,20 @@ void app_main(void)
              es.neg_pressed ? "PULSADO" : "libre",
              es.pos_pressed ? "PULSADO" : "libre");
 
-    ESP_ERROR_CHECK(kundt_api_init(cfg.server_ip, API_PORT, cfg.kit));
+    s_cmd_queue = xQueueCreate(1, sizeof(kundt_mqtt_actuators_t));
+    if (s_cmd_queue == NULL) {
+        ESP_LOGE(TAG, "sin memoria para la cola de consignas");
+        return;
+    }
 
     ESP_ERROR_CHECK(kundt_wifi_init());
     ESP_ERROR_CHECK(kundt_wifi_connect(cfg.wifi_ssid, cfg.wifi_password));
+
+    char broker[48];
+    ESP_ERROR_CHECK(kundt_config_broker_uri(broker, sizeof(broker)));
+    ESP_ERROR_CHECK(kundt_mqtt_start(broker, cfg.platform_id, cfg.controller_id,
+                                     on_actuators, NULL));
+
     kundt_led_set_state(KUNDT_LED_NO_WIFI);
 
 #if CONFIG_E3_SELFTEST

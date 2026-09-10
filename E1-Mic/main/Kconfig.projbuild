@@ -1,5 +1,33 @@
 menu "E1-Mic module"
 
+    config E1_DEBUG_STREAM
+        bool "Enable the raw-audio WebSocket stream"
+        default n
+        help
+            Streams raw PCM over a binary WebSocket, about 93 KiB/s. It was the
+            module's only output before the move to MQTT and is kept purely as a
+            debugging aid: it is the one way to look at the analog front end's
+            waveform from the PC.
+
+            Leave this OFF for the real module. Beyond the bandwidth, a blocking
+            send on a busy link starves the ADC pool, which is what caused the
+            sample loss seen during the FIS130 bench run.
+
+    config E1_GOERTZEL_WINDOW
+        int "Goertzel window, in samples"
+        range 256 16384
+        default 4096
+        help
+            Sets both the measurement's noise rejection and how often the module
+            reports. At 44.1 kHz, 4096 samples are 93 ms and a 10.8 Hz bin,
+            worth about 33 dB against white noise, and produce roughly 10
+            reports per second.
+
+            Doubling it buys 3 dB and halves the report rate. It is the only
+            knob for that trade-off, so change this rather than adding a
+            separate rate limit.
+
+
     config E1_SELFTEST_DAC
         bool "Enable DAC loopback self-test"
         default n

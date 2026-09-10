@@ -26,6 +26,24 @@ menu "Kundt tube configuration"
             Host running the Kundt lab backend. The WebSocket port is derived
             from the kit number as 8080 + kit.
 
+    config KUNDT_DEFAULT_PLATFORM_ID
+        int "curiousBeagle platform id"
+        range 1 255
+        default 1
+        help
+            Platform row this rig maps to in the curiousBeagle database. Part of
+            the MQTT topic: dev-status/kundt/<platform>/<controller>. It is NOT
+            the same numbering as the kit number, so it is configured apart.
+
+    config KUNDT_DEFAULT_CONTROLLER_ID
+        int "curiousBeagle controller id"
+        range 1 255
+        default 1
+        help
+            Controller row this rig maps to. E1, E2 and E3 share a single
+            logical controller and tell themselves apart by which fields they
+            publish, so all three carry the same value.
+
     config KUNDT_DEFAULT_KIT
         int "Kit number"
         range 1 5

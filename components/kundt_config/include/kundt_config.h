@@ -30,11 +30,21 @@ extern "C" {
  * kit 1 escucha en 8081 y el kit 5 en 8085. */
 #define KUNDT_WS_PORT_BASE 8080
 
+/* Puerto MQTT del broker. Fijo: Mosquitto escucha en el 1883 tanto en el banco
+ * local como en el despliegue de curiousBeagle. Se deja aquí y no en NVS para
+ * no añadir una clave que nunca cambia. */
+#define KUNDT_MQTT_PORT 1883
+
 typedef struct {
     char     wifi_ssid[KUNDT_SSID_MAX_LEN + 1];
     char     wifi_password[KUNDT_PASSWORD_MAX_LEN + 1];
     char     server_ip[KUNDT_IP_MAX_LEN + 1];
     uint8_t  kit;  /* 1..5 */
+    /* Identidad dentro de curiousBeagle. Forma el tópico MQTT
+     * dev-status/kundt/<platform_id>/<controller_id>. No coincide con la
+     * numeración de kit, por eso va aparte. */
+    uint8_t  platform_id;
+    uint8_t  controller_id;
 } kundt_config_t;
 
 /**
@@ -56,6 +66,19 @@ esp_err_t kundt_config_set_kit(uint8_t kit);
 
 /** @brief Guarda la dirección del servidor (cadena en decimal punteado). */
 esp_err_t kundt_config_set_server_ip(const char *ip);
+
+/** @brief Fija la identidad de este equipo dentro de curiousBeagle. */
+esp_err_t kundt_config_set_ids(uint8_t platform_id, uint8_t controller_id);
+
+/**
+ * @brief Arma la URI del broker MQTT, p. ej. "mqtt://192.168.0.100:1883".
+ *
+ * Reutiliza la IP del servidor: en el banco local y en el despliegue real el
+ * broker vive en el mismo host que la API.
+ *
+ * @return ESP_OK, o ESP_ERR_INVALID_SIZE si @p buf es demasiado pequeño.
+ */
+esp_err_t kundt_config_broker_uri(char *buf, size_t buf_len);
 
 /** @brief Puerto WebSocket del kit activo (KUNDT_WS_PORT_BASE + kit). */
 uint16_t kundt_config_ws_port(void);

@@ -124,6 +124,101 @@ typedef struct {
  */
 void mic_dsp_analyze(const int16_t *pcm, size_t n, mic_pcm_stats_t *out);
 
+/*
+ * ------------------------------------------------------------------------
+ * Goertzel: nivel de la señal en una sola frecuencia.
+ * ------------------------------------------------------------------------
+ *
+ * El RMS de mic_dsp_analyze mide TODO lo que entra: el motor paso a paso, los
+ * ventiladores, el rizado de conmutación de la fuente y el tono del tubo, todo
+ * sumado. Como la frecuencia de excitación la fija E2 y por tanto se conoce,
+ * medir sólo esa componente rechaza el resto.
+ *
+ * Goertzel evalúa un único punto de la DFT con una recurrencia de dos estados,
+ * en tiempo lineal y sin buffer intermedio. Frente a una FFT completa evita
+ * reordenar, no necesita memoria adicional y calcula sólo lo que hace falta.
+ *
+ * El ancho de banda de ruido equivalente es fs/window. Con 4096 muestras a
+ * 44,1 kHz son 10,8 Hz frente a los 22 kHz del RMS de banda ancha: unos 33 dB
+ * de mejora en relación señal a ruido para ruido blanco.
+ *
+ * Se usa float y no punto fijo porque el ESP32 tiene FPU de precisión simple por
+ * hardware. Con double la FPU no sirve y se emula por software.
+ *
+ * La frecuencia NO tiene por qué caer en un bin exacto: el coeficiente admite
+ * un índice fraccionario y la fórmula de potencia sigue siendo válida. Eso
+ * importa porque E2 fija frecuencias arbitrarias, no múltiplos de fs/window.
+ */
+typedef struct {
+    float  coeff;   /* 2*cos(2*pi*f/fs); fija la frecuencia evaluada. */
+    float  s1;      /* Estado de la recurrencia, retardo de una muestra. */
+    float  s2;      /* Estado de la recurrencia, retardo de dos muestras. */
+    size_t n;       /* Muestras acumuladas en la ventana en curso. */
+    size_t window;  /* Muestras por ventana. */
+} mic_goertzel_t;
+
+/* Ventana por defecto: 4096 muestras son 93 ms a 44,1 kHz y unos 10,8 Hz de
+ * ancho de bin. Suficientemente corta para que el émbolo no se desplace de
+ * forma apreciable durante la medida, y suficientemente larga para promediar
+ * unos 100 ciclos a 1 kHz. */
+#define MIC_GOERTZEL_WINDOW_DEFAULT 4096u
+
+/**
+ * @brief Prepara el detector para una frecuencia concreta.
+ *
+ * Reinicia el estado y el contador de muestras. Hay que volver a llamarla cada
+ * vez que E2 cambia la frecuencia de excitación.
+ *
+ * @param g            Instancia (no puede ser NULL).
+ * @param freq_hz      Frecuencia a medir. Se acota a [0, fs/2].
+ * @param sample_hz    Frecuencia de muestreo del ADC.
+ * @param window       Muestras por ventana; se acota a un mínimo de 8.
+ */
+void mic_goertzel_init(mic_goertzel_t *g, float freq_hz, float sample_hz, size_t window);
+
+/** @brief Vacía el estado y empieza una ventana nueva sin recalcular el coeficiente. */
+void mic_goertzel_reset(mic_goertzel_t *g);
+
+/** @brief Introduce una muestra PCM. Es el camino crítico: tres operaciones. */
+static inline void mic_goertzel_push(mic_goertzel_t *g, int16_t sample)
+{
+    const float s0 = (float)sample + g->coeff * g->s1 - g->s2;
+    g->s2 = g->s1;
+    g->s1 = s0;
+    g->n++;
+}
+
+/** @brief Introduce un bloque completo de PCM. */
+void mic_goertzel_push_block(mic_goertzel_t *g, const int16_t *pcm, size_t n);
+
+/** @brief true cuando ya hay una ventana entera acumulada. */
+static inline bool mic_goertzel_ready(const mic_goertzel_t *g)
+{
+    return g->n >= g->window;
+}
+
+/**
+ * @brief Valor eficaz de la componente medida, en cuentas de PCM.
+ *
+ * Devuelve la MISMA unidad que sqrt(sum_sq / n) de mic_dsp_analyze, a propósito:
+ * para un tono puro sin ruido los dos coinciden, y el cociente entre ambos dice
+ * qué fracción del nivel es realmente el tono. Ese cociente es el diagnóstico
+ * que distingue "hay señal" de "hay ruido".
+ *
+ * Normaliza por las muestras realmente acumuladas, así que una ventana a medias
+ * da un resultado válido aunque más ruidoso.
+ */
+float mic_goertzel_rms(const mic_goertzel_t *g);
+
+/**
+ * @brief Atajo de una sola llamada sobre un bloque ya completo.
+ *
+ * Equivale a init, push_block y rms. Pensado para los tests y para código que ya
+ * tiene la ventana entera en memoria; el camino del firmware usa la versión por
+ * bloques, porque el DMA entrega tramas, no ventanas.
+ */
+float mic_goertzel_block(const int16_t *pcm, size_t n, float freq_hz, float sample_hz);
+
 #ifdef __cplusplus
 }
 #endif
