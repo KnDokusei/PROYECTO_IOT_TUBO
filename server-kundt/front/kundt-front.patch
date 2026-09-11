@@ -1,0 +1,42 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 513c396..4e7906d 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -50,6 +50,11 @@ export const SSE_PENDULUM_UPDATES = API_STRING_BASE + "/" + EXPERIMENT_BASE + "/
+ export const SET_PENDULUM_FROM_PLATFORM_ID = API_STRING_BASE + "/" + EXPERIMENT_BASE + "/" + "pendulum-set" + "/";
+ export const GET_PENDULUM_FROM_PLATFORM_ID = API_STRING_BASE + "/" + EXPERIMENT_BASE + "/" + "pendulum-get" + "/";
+ 
++// Kundt tube routes
++export const GET_KUNDT_FROM_PLATFORM_ID = API_STRING_BASE + "/" + EXPERIMENT_BASE + "/" + "kundt-get" + "/";
++export const SET_KUNDT_FROM_PLATFORM_ID = API_STRING_BASE + "/" + EXPERIMENT_BASE + "/" + "kundt-set" + "/";
++export const SSE_KUNDT_UPDATES = API_STRING_BASE + "/" + EXPERIMENT_BASE + "/" + "kundt-updates";
++
+ // Camera routes
+ export const CAMERA_VIDEO_BASE = "video";
+ export const GET_CAMERAS_BY_PLATFORM = API_STRING_BASE + "/" + CAMERA_VIDEO_BASE + "/" + "camera-platform" + "/";
+\ No newline at end of file
+diff --git a/src/pages/Router.tsx b/src/pages/Router.tsx
+index cc01037..f24f4e6 100644
+--- a/src/pages/Router.tsx
++++ b/src/pages/Router.tsx
+@@ -11,6 +11,8 @@ import Reservation from "./Reservation/Reservation";
+ import CMUI from "./experiments/ChargeMass/CMUI";
+ import Pendulum from "./experiments/Pendulum/Pendulum";
+ import { validatePendulumPlatform } from "./experiments/Pendulum/pendulum_loader";
++import Kundt from "./experiments/Kundt/Kundt";
++import { validateKundtPlatform } from "./experiments/Kundt/kundt_loader";
+ 
+ export const router = createBrowserRouter([
+     {
+@@ -62,6 +64,11 @@ export const router = createBrowserRouter([
+                                 path: "pendulum/:id",
+                                 element: <Pendulum />,
+                                 loader: validatePendulumPlatform
++                            },
++                            {
++                                path: "kundt/:id",
++                                element: <Kundt />,
++                                loader: validateKundtPlatform
+                             }
+                         ]
+                     },

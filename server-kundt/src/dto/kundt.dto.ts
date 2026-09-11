@@ -31,6 +31,18 @@ export class KundtActuators {
     @IsOptional()
     @IsNumber()
     plunger_pos: number;
+
+    /*
+     * E3-StepMotor: one-shot request to re-run the limit-switch homing routine.
+     *
+     * Unlike the fields above this one is NOT persisted: it is a command, not a
+     * setpoint. Storing it would make every later update re-trigger homing, and
+     * the column would never describe the rig's actual state. `setKundtExp`
+     * forwards it over MQTT and drops it before writing the row.
+     */
+    @IsOptional()
+    @IsBoolean()
+    calibrate?: boolean;
 }
 
 export class KundtSensors {

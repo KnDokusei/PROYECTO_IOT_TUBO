@@ -75,7 +75,7 @@ index a6b61ca..8487cac 100644
 +
  }
 diff --git a/src/exp/exp.service.ts b/src/exp/exp.service.ts
-index e17ac5c..8211192 100644
+index e17ac5c..16dad82 100644
 --- a/src/exp/exp.service.ts
 +++ b/src/exp/exp.service.ts
 @@ -1,8 +1,9 @@
@@ -89,7 +89,7 @@ index e17ac5c..8211192 100644
  import { MqttService } from "src/mqtt/mqtt.service";
  import { PrismaService } from "src/prisma/prisma.service";
  
-@@ -378,4 +379,64 @@ export class ExpService {
+@@ -378,4 +379,72 @@ export class ExpService {
          return { camera_position: entry.stepper_pos };
  
      }
@@ -144,9 +144,17 @@ index e17ac5c..8211192 100644
 +        });
 +
 +        const as_object = this.kundtEntry2Actuators(updated_entry);
++
++        /*
++         * `calibrate` rides along with the setpoints but is never stored: see
++         * the note on the DTO. Only add it when explicitly requested, so a
++         * routine frequency change does not send the plunger home.
++         */
 +        const computed_body = {
 +            id: entry.id,
-+            actuators: as_object
++            actuators: actuators.calibrate === true
++                ? { ...as_object, calibrate: true }
++                : as_object
 +        };
 +
 +        await this.mqttService.publishUpdate(KUNDT_TOPIC, platform_id, entry.id, computed_body);

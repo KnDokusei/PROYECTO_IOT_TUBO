@@ -14,6 +14,8 @@ equipo (DopamineLabsLTDA) y el molde que se copió es suyo y todavía preliminar
 | `prisma/seed-kundt.sql` | Siembra local idempotente de las cinco tablas encadenadas |
 | `prisma/seed-kundt.sh` | Genera el hash argon2 y llama a psql |
 | `env.example` | Plantilla de variables, sin valores reales |
+| `front/kundt-front.patch` | Cambios a `routes.ts` y `Router.tsx` de curiousBeagleFront |
+| `front/src/...` | Vista de Kundt: tipos, cliente de API, loader y `Kundt.tsx` |
 
 ## Cómo aplicarlo
 
@@ -27,6 +29,34 @@ cp -r /ruta/a/server-kundt/prisma/* prisma/
 ```
 
 Luego `npx prisma migrate deploy` y `./prisma/seed-kundt.sh`.
+
+Para el frontend:
+
+```bash
+git clone git@github.com:DopamineLabsLTDA/curiousBeagleFront.git
+cd curiousBeagleFront
+git apply /ruta/a/server-kundt/front/kundt-front.patch
+cp -r /ruta/a/server-kundt/front/src/. src/
+```
+
+**Aviso sobre el submódulo del front.** `curiousBeagle` registra el commit
+`26803bd` para `curiousBeagleFront`, y ese objeto ya no existe en el remoto: lo
+reescribieron con un force-push. Un `git submodule update --init` limpio falla
+con `upload-pack: not our ref`. Hay que hacer checkout de `main` a mano dentro
+del submódulo.
+
+## Estado verificado, 2026-09-10
+
+- El parche aplica limpio sobre `b6d3491`, el `main` actual de curiousBeagleAPI.
+- API y frontend compilan con 0 errores de tipos.
+- Camino completo probado con hardware real: navegador → API → MQTT → E2 →
+  parlante → micrófono → E1 → MQTT → API → SSE → navegador.
+
+## Lo que falta en el firmware
+
+El botón de calibrar publica `calibrate: true`, pero **E3 todavía no lo
+atiende**: sólo calibra en `app_main` y su `on_actuators` únicamente acepta
+`plunger_pos`. Son unas diez líneas en `E3-StepMotor/main/main.c`.
 
 ## Contrato MQTT
 
