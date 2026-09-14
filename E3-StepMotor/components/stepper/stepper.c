@@ -4,6 +4,7 @@
 
 #include "stepper.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -31,6 +32,24 @@ static const char *TAG = "stepper";
  * macro con un operador suelto cambia de significado según el lado en que se
  * use en la multiplicación. */
 #define CALIB_TIMEOUT_PCT 150
+
+/* Barrido del segundo tramo (al fin de carrera positivo): se pide este
+ * porcentaje de más sobre el recorrido nominal, por si el riel real es más
+ * largo que STEPPER_POS_LIMIT_CM. */
+#define CALIB_SWEEP_MARGIN_PCT 120
+
+/* Diferencia entre el largo medido y el configurado a partir de la cual se
+ * loguea una advertencia (no aborta: sólo avisa). */
+#define CALIB_LENGTH_WARN_CM 0.5f
+
+/* Un bool de Kconfig en "n" no genera macro (no hay CONFIG_X = 0, la macro
+ * directamente no existe), así que sólo es seguro usarlo dentro de un `#if`.
+ * Esto lo normaliza a 0/1 para poder usarlo también en expresiones C normales. */
+#ifdef CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH
+#define CALIB_TRUST_MEASURED 1
+#else
+#define CALIB_TRUST_MEASURED 0
+#endif
 
 static struct {
     gptimer_handle_t timer;
@@ -328,6 +347,19 @@ void stepper_set_position(int32_t steps)
     gpio_set_level(s.cfg.sleep_gpio, 0);
 }
 
+int32_t stepper_active_pos_limit_steps(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    const int32_t m = s.max_steps;
+    portEXIT_CRITICAL(&s_mux);
+    return m;
+}
+
+bool stepper_calib_trusts_measured(void)
+{
+    return CALIB_TRUST_MEASURED;
+}
+
 bool stepper_is_moving(void)
 {
     portENTER_CRITICAL(&s_mux);
@@ -344,11 +376,51 @@ void stepper_get_stats(stepper_stats_t *out)
     portENTER_CRITICAL(&s_mux);
     out->position_steps = s.position;
     out->target_steps   = s.target;
+    out->min_steps      = s.min_steps;
+    out->max_steps      = s.max_steps;
     out->moving         = s.moving;
     out->calibrated     = s.calibrated;
     out->endstop_stops  = s.endstop_stops;
     out->steps_emitted  = s.steps_emitted;
     portEXIT_CRITICAL(&s_mux);
+}
+
+/*
+ * Mueve hacia `target` y espera a que termine, por fin de carrera o timeout.
+ * `budget_steps` es la distancia de referencia para el presupuesto de tiempo
+ * (con margen CALIB_TIMEOUT_PCT) — puede ser mayor a la distancia real si se
+ * está dejando margen para un riel más largo de lo asumido. `*by_endstop`
+ * queda en true sólo si lo que detuvo el movimiento fue un fin de carrera.
+ */
+static esp_err_t home_leg(int32_t target, int32_t budget_steps, bool *by_endstop)
+{
+    portENTER_CRITICAL(&s_mux);
+    const uint32_t hits_before = s.endstop_stops;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t err = stepper_move_to(target);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const int64_t budget_us = (int64_t)budget_steps * 1000000 / s.cfg.calib_speed_sps
+                              * CALIB_TIMEOUT_PCT / 100;
+    const int64_t deadline = esp_timer_get_time() + budget_us;
+
+    while (stepper_is_moving()) {
+        if (esp_timer_get_time() > deadline) {
+            stepper_stop();
+            ESP_LOGE(TAG, "la calibración excedió %lld s sin alcanzar el fin de carrera",
+                     (long long)(budget_us / 1000000));
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    portENTER_CRITICAL(&s_mux);
+    *by_endstop = (s.endstop_stops != hits_before);
+    portEXIT_CRITICAL(&s_mux);
+    return ESP_OK;
 }
 
 esp_err_t stepper_calibrate(void)
@@ -362,62 +434,99 @@ esp_err_t stepper_calibrate(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    const int32_t travel = s.max_steps - s.min_steps;
-
-    /* Se parte suponiendo el émbolo en el extremo lejano, que es el caso peor:
-     * así el recorrido comandado cubre el riel completo venga de donde venga. */
-    portENTER_CRITICAL(&s_mux);
-    s.position              = s.max_steps;
-    const uint32_t hits_before = s.endstop_stops;
-    portEXIT_CRITICAL(&s_mux);
-
-    ESP_LOGI(TAG, "calibrando: buscando el fin de carrera de %.1f cm...",
-             (double)STEPPER_NEG_LIMIT_CM);
+    const int32_t nominal_travel = s.max_steps - s.min_steps;
 
     esp_err_t err = set_speed(s.cfg.calib_speed_sps);
     if (err != ESP_OK) {
         return err;
     }
 
-    err = stepper_move_to(s.min_steps);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    /* Presupuesto de tiempo en vez del `while (true)` sin salida del sketch
-     * original: si el switch no responde se aborta en vez de empujar el riel
-     * contra el tope indefinidamente (hallazgo B2). */
-    const int64_t budget_us = (int64_t)travel * 1000000 / s.cfg.calib_speed_sps
-                              * CALIB_TIMEOUT_PCT / 100;
-    const int64_t deadline = esp_timer_get_time() + budget_us;
-
-    while (stepper_is_moving()) {
-        if (esp_timer_get_time() > deadline) {
-            stepper_stop();
-            ESP_LOGE(TAG, "la calibración excedió %lld s sin alcanzar el fin de carrera",
-                     (long long)(budget_us / 1000000));
-            set_speed(s.cfg.speed_sps);
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    set_speed(s.cfg.speed_sps);
-
+    /* Tramo 1: al negativo, que fija el origen. Se parte suponiendo el émbolo
+     * en el extremo lejano, el caso peor: así el recorrido comandado cubre el
+     * riel completo venga de donde venga. */
     portENTER_CRITICAL(&s_mux);
-    const bool by_endstop = (s.endstop_stops != hits_before);
-    if (by_endstop) {
-        s.calibrated = true;
-    }
+    s.position = s.max_steps;
     portEXIT_CRITICAL(&s_mux);
 
-    if (!by_endstop) {
-        /* Recorrió el riel entero sin que el switch se activara nunca. */
+    ESP_LOGI(TAG, "calibrando: buscando el fin de carrera de %.1f cm...",
+             (double)STEPPER_NEG_LIMIT_CM);
+
+    bool neg_hit = false;
+    err = home_leg(s.min_steps, nominal_travel, &neg_hit);
+    if (err != ESP_OK) {
+        set_speed(s.cfg.speed_sps);
+        return err;
+    }
+    if (!neg_hit) {
+        set_speed(s.cfg.speed_sps);
         ESP_LOGE(TAG, "recorrido completo sin detectar el fin de carrera: "
                       "revisa el cableado de GPIO%d", s.cfg.endstop_neg_gpio);
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(TAG, "calibrado: origen en %.2f cm", (double)STEPPER_NEG_LIMIT_CM);
+    /* Tramo 2: barrido completo hasta el positivo, para MEDIR el largo real
+     * del riel (contando pasos) en vez de asumir STEPPER_POS_LIMIT_CM a
+     * ciegas — es la caracterización que motiva este barrido. Se pide un
+     * margen extra sobre lo nominal por si el riel real es más largo; para
+     * eso hay que correr el límite activo (`s.max_steps`) temporalmente para
+     * que stepper_move_to no acote el destino a lo ya configurado. */
+    ESP_LOGI(TAG, "calibrando: barriendo hasta el fin de carrera de %.1f cm...",
+             (double)STEPPER_POS_LIMIT_CM);
+
+    const int32_t sweep_budget = nominal_travel * CALIB_SWEEP_MARGIN_PCT / 100;
+
+    portENTER_CRITICAL(&s_mux);
+    const int32_t configured_max = s.max_steps;
+    s.max_steps = s.min_steps + sweep_budget;
+    const uint64_t steps_before = s.steps_emitted;
+    portEXIT_CRITICAL(&s_mux);
+
+    bool pos_hit = false;
+    err = home_leg(s.min_steps + sweep_budget, sweep_budget, &pos_hit);
+    set_speed(s.cfg.speed_sps);
+
+    portENTER_CRITICAL(&s_mux);
+    const uint64_t steps_after = s.steps_emitted;
+    s.max_steps = configured_max; /* se recalcula abajo con el valor definitivo */
+    portEXIT_CRITICAL(&s_mux);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (!pos_hit) {
+        ESP_LOGE(TAG, "recorrido completo sin detectar el fin de carrera: "
+                      "revisa el cableado de GPIO%d", s.cfg.endstop_pos_gpio);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const int32_t measured_travel = (int32_t)(steps_after - steps_before);
+    const float   measured_cm     = stepper_steps_to_cm(measured_travel);
+    const float   configured_cm   = (float)STEPPER_POS_LIMIT_CM - (float)STEPPER_NEG_LIMIT_CM;
+    const float   diff_cm         = measured_cm - configured_cm;
+
+    ESP_LOGI(TAG, "largo medido: %.2f cm (configurado: %.2f cm, diferencia: %+.2f cm)",
+             (double)measured_cm, (double)configured_cm, (double)diff_cm);
+    if (fabsf(diff_cm) > CALIB_LENGTH_WARN_CM) {
+        ESP_LOGW(TAG, "el largo medido difiere del configurado en más de %.1f cm: "
+                      "revisa STEPPER_POS_LIMIT_CM o el estado mecánico del riel.",
+                 (double)CALIB_LENGTH_WARN_CM);
+    }
+
+    const int32_t measured_max_steps = s.min_steps + measured_travel;
+
+    portENTER_CRITICAL(&s_mux);
+    s.position = measured_max_steps; /* ahí quedó el émbolo, de verdad */
+#if CALIB_TRUST_MEASURED
+    s.max_steps = measured_max_steps;
+#else
+    s.max_steps = stepper_pos_limit_steps();
+#endif
+    s.calibrated = true;
+    portEXIT_CRITICAL(&s_mux);
+
+    ESP_LOGI(TAG, "calibrado: origen en %.2f cm, límite positivo activo en %.2f cm (%s)",
+             (double)STEPPER_NEG_LIMIT_CM, (double)stepper_steps_to_cm(s.max_steps),
+             CALIB_TRUST_MEASURED ? "medido" : "configurado");
+
     return ESP_OK;
 }

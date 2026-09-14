@@ -33,6 +33,26 @@ del proyecto original. E3 está migrado y su autoprueba de banco pasa entera
 (21/21), pero **todavía no se ha probado sobre el motor real**: hasta entonces,
 el sketch de Arduino sigue siendo el firmware de referencia para ese módulo.
 
+**Pendiente:** E3 ya tiene una máquina de estados explícita (INIT: calibración
+al arrancar, sin cliente MQTT arriba —el WiFi sí sube antes, para la OTA—;
+IDLE: esperando consigna; BUSY: émbolo en movimiento para el experimento
+remoto que lo está usando). Falta llevar el mismo patrón a E1 y E2, y en los
+tres reforzar la robustez de esa máquina: qué hacer ante una calibración que
+falla en caliente, y checks periódicos o entre sesiones (no sólo al arrancar)
+para detectar que el hardware se descalibró mientras el laboratorio remoto
+seguía operando.
+
+**Caracterización del riel (E3):** la calibración recorre el riel completo
+(no sólo busca el origen) y mide el largo real contando pasos entre los dos
+fines de carrera, porque el objetivo del módulo es que la web le dé una única
+entrada —posición X— y eso exige conocer el mapeo cm↔pasos con precisión, no
+asumirlo. El largo medido se loguea siempre junto al configurado
+(`STEPPER_POS_LIMIT_CM`) y su diferencia; `CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH`
+(Kconfig, apagado por defecto) decide si ese valor medido pasa a ser el límite
+que se usa para acotar movimientos, o si sólo se informa mientras el límite
+configurado sigue mandando — a definir según lo que decida el resto del
+equipo con los primeros datos reales del riel.
+
 ## Estructura
 
 ```

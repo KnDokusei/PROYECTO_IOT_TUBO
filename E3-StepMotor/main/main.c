@@ -32,6 +32,43 @@
 static const char *TAG = "E3-StepMotor";
 
 /*
+ * Máquina de estados del módulo, de cara al laboratorio remoto: qué tan libre
+ * está este experimento para que otro lo ocupe.
+ *
+ *   INIT -> IDLE   al terminar la calibración offline (sin red).
+ *   IDLE -> BUSY   al llegar una consigna por MQTT que mueve el émbolo.
+ *   BUSY -> IDLE   al llegar el émbolo a destino, o al cortarse la red.
+ *
+ * Sólo la tarea de control la toca tras el arranque: un único escritor evita
+ * la necesidad de mutex.
+ */
+typedef enum {
+    E3_STATE_INIT = 0,
+    E3_STATE_IDLE,
+    E3_STATE_BUSY,
+} e3_state_t;
+
+static e3_state_t s_state = E3_STATE_INIT;
+
+static const char *e3_state_name(e3_state_t st)
+{
+    switch (st) {
+    case E3_STATE_INIT: return "INIT";
+    case E3_STATE_IDLE: return "IDLE";
+    case E3_STATE_BUSY: return "BUSY";
+    default:            return "?";
+    }
+}
+
+static void e3_set_state(e3_state_t st)
+{
+    if (st != s_state) {
+        ESP_LOGI(TAG, "estado %s -> %s", e3_state_name(s_state), e3_state_name(st));
+        s_state = st;
+    }
+}
+
+/*
  * Ya no hay sondeo: la consigna llega empujada por MQTT. Este intervalo es el
  * ritmo con que se revisa el estado del motor y se informa la posición, y se
  * mantiene en los 500 ms del sketch original porque marca la resolución
@@ -55,6 +92,8 @@ static const char *TAG = "E3-StepMotor";
  * vale es el último: encolarlos todos haría recorrer posiciones que nadie pidió.
  */
 static QueueHandle_t s_cmd_queue;
+
+//La siguiente función anota consignas en la cola, y corre en la tarea de eventos de esp_mqtt_client.
 
 static void on_actuators(const kundt_mqtt_actuators_t *act, void *ctx)
 {
@@ -93,6 +132,9 @@ static void control_task(void *arg)
                 ESP_LOGW(TAG, "sin WiFi: se detiene el motor");
                 stepper_stop();
             }
+            /* Sin red no hay forma de que el laboratorio remoto siga viendo
+             * este experimento como ocupado: se libera. */
+            e3_set_state(E3_STATE_IDLE);
             kundt_led_set_state(KUNDT_LED_NO_WIFI);
             continue;
         }
@@ -115,9 +157,11 @@ static void control_task(void *arg)
              * hallazgo A3: el servidor viejo nunca documentó la unidad, y aquí
              * no hay nada que deducir. */
             const float   want_cm = cmd.plunger_pos;
+
+            // Checkea umbrales por si los hubieran valores ilegales. Se hace en pasos para que la consigna acotada sea exacta y no quede un decimal que el motor no pueda alcanzar.
             const int32_t want    = stepper_clamp_steps(stepper_cm_to_steps(want_cm),
                                                         stepper_neg_limit_steps(),
-                                                        stepper_pos_limit_steps());
+                                                        stepper_active_pos_limit_steps());
 
             /* El aviso se emite al cambiar la petición, no en cada consulta:
              * un backend que insiste en un valor fuera de rango llenaría el log
@@ -153,6 +197,10 @@ static void control_task(void *arg)
          * que los 0,1 cm que promete el README (hallazgo A2).
          */
         const bool moving = stepper_is_moving();
+        /* BUSY mientras el émbolo recorre camino hacia la consigna vigente;
+         * de vuelta a IDLE en cuanto llega, sin esperar el próximo mensaje. */
+        e3_set_state(moving ? E3_STATE_BUSY : E3_STATE_IDLE);
+
         if (moving || was_moving || got) {
             const stepper_endstops_t now_es = stepper_read_endstops();
             const kundt_mqtt_sensors_t m = {
@@ -186,10 +234,23 @@ static void control_task(void *arg)
                      (unsigned long)kundt_mqtt_published(), (unsigned long)pub_failed,
                      kundt_wifi_ip(),
                      kundt_mqtt_is_connected() ? "arriba" : "abajo");
-            ESP_LOGI(TAG, "FIN  carrera -: %s   carrera +: %s   calibrado: %s",
+            ESP_LOGI(TAG, "FIN  carrera -: %s   carrera +: %s   calibrado: %s   estado: %s",
                      es.neg_pressed ? "PULSADO" : "libre",
                      es.pos_pressed ? "PULSADO" : "libre",
-                     st.calibrated ? "sí" : "NO");
+                     st.calibrated ? "sí" : "NO",
+                     e3_state_name(s_state));
+
+            /* Largo total del riel según el límite positivo activo (medido o
+             * configurado, según CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH) y
+             * posición actual relativa a ese largo, para caracterizar el
+             * recorrido de cara al mapeo de "posición X" que usará la web. */
+            const float rail_cm = stepper_steps_to_cm(st.max_steps - st.min_steps);
+            const float pos_cm  = stepper_steps_to_cm(st.position_steps - st.min_steps);
+            const float pct     = (rail_cm > 0.0f) ? (pos_cm / rail_cm) * 100.0f : 0.0f;
+            ESP_LOGI(TAG, "RIEL largo=%.2f cm (%s)  posición=%.2f/%.2f cm (%.1f%%)",
+                     (double)rail_cm,
+                     stepper_calib_trusts_measured() ? "medido" : "configurado",
+                     (double)pos_cm, (double)rail_cm, (double)pct);
         }
     }
 }
@@ -244,16 +305,15 @@ void app_main(void)
         return;
     }
 
+    /* WiFi sube ya: la OTA la necesita disponible cuanto antes y no depende
+     * de que el riel esté referenciado. Lo que se retrasa hasta IDLE es sólo
+     * el cliente MQTT: mientras no esté suscrito no puede llegar una consigna
+     * que compita con la calibración por el motor. */
     ESP_ERROR_CHECK(kundt_wifi_init());
     ESP_ERROR_CHECK(kundt_wifi_connect(cfg.wifi_ssid, cfg.wifi_password));
 
-    char broker[48];
-    ESP_ERROR_CHECK(kundt_config_broker_uri(broker, sizeof(broker)));
-    ESP_ERROR_CHECK(kundt_mqtt_start(broker, cfg.platform_id, cfg.controller_id,
-                                     on_actuators, NULL));
-
-    kundt_led_set_state(KUNDT_LED_NO_WIFI);
-
+    /* Estado INIT: la calibración es una orden a ciegas hacia el fin de
+     * carrera y corre antes de que el motor pueda recibir órdenes por MQTT. */
 #if CONFIG_E3_SELFTEST
     kundt_led_mark_selftest();
     /* Corre antes de la calibración: comprueba el generador de pasos contra el
@@ -267,8 +327,6 @@ void app_main(void)
     ESP_LOGW(TAG, "CALIBRACIÓN OMITIDA por configuración: la posición informada");
     ESP_LOGW(TAG, "no tiene referencia física. Sólo para pruebas de banco.");
 #else
-    /* La calibración no necesita red: se hace apenas el hardware está listo,
-     * para que el riel quede referenciado cuanto antes. */
     const esp_err_t cal = stepper_calibrate();
     if (cal != ESP_OK) {
         ESP_LOGE(TAG, "la calibración falló (%s).", esp_err_to_name(cal));
@@ -276,13 +334,24 @@ void app_main(void)
         ESP_LOGE(TAG, "pero NO moverá el motor: sin referencia, cualquier destino");
         ESP_LOGE(TAG, "es una orden a ciegas contra los topes del riel.");
         kundt_led_set_state(KUNDT_LED_NO_SERVER);
-        /* Se deja el módulo vivo pero quieto: informar la posición de un riel
-         * sin referenciar sería peor que no informar nada. */
+        /* Se queda en INIT a propósito: sin referencia no hay IDLE que
+         * ofrecerle al laboratorio remoto. Vivo pero quieto: informar la
+         * posición de un riel sin referenciar sería peor que no informar
+         * nada. */
         for (;;) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 #endif
+
+    e3_set_state(E3_STATE_IDLE);
+
+    char broker[48];
+    ESP_ERROR_CHECK(kundt_config_broker_uri(broker, sizeof(broker)));
+    ESP_ERROR_CHECK(kundt_mqtt_start(broker, cfg.platform_id, cfg.controller_id,
+                                     on_actuators, NULL));
+
+    kundt_led_set_state(KUNDT_LED_NO_WIFI);
 
     xTaskCreate(control_task, "e3_control", 4096, NULL, 5, NULL);
 }

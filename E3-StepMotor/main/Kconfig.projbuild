@@ -79,6 +79,18 @@ config E3_SELFTEST_STEPS
     help
       1000 pasos son 4 cm de riel y unos 2 s a 500 pasos/s.
 
+config E3_CALIB_TRUST_MEASURED_LENGTH
+    bool "Usar el largo medido (no STEPPER_POS_LIMIT_CM) como limite positivo activo"
+    default n
+    help
+      La calibracion ahora recorre el riel completo (no solo el origen) y mide
+      el largo real contando pasos entre los dos fines de carrera. Con esta
+      opcion apagada (por defecto) ese valor medido solo se informa por log,
+      comparado contra STEPPER_POS_LIMIT_CM, y el limite que se usa para
+      acotar movimientos sigue siendo el configurado. Con esta opcion prendida,
+      el limite positivo activo pasa a ser el medido en esa pasada. En ambos
+      casos la posicion informada despues de calibrar es la real.
+
 config E3_SKIP_CALIBRATION
     bool "Omitir la calibracion al arrancar (solo banco de pruebas)"
     default n

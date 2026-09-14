@@ -64,6 +64,9 @@ typedef struct {
 typedef struct {
     int32_t  position_steps;
     int32_t  target_steps;
+    int32_t  min_steps; /* límite negativo activo (siempre el configurado) */
+    int32_t  max_steps; /* límite positivo activo: medido o configurado, ver
+                          * CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH */
     bool     moving;
     bool     calibrated;
     uint32_t endstop_stops; /* movimientos abortados por un fin de carrera */
@@ -82,14 +85,22 @@ esp_err_t stepper_init(const stepper_config_t *cfg);
 stepper_endstops_t stepper_read_endstops(void);
 
 /**
- * @brief Busca el fin de carrera negativo y fija ahí el origen.
+ * @brief Recorre el riel de punta a punta y mide su largo real.
  *
- * Bloquea hasta terminar. A diferencia del sketch original, que giraba en un
- * `while (true)` sin salida, aquí hay un presupuesto máximo de pasos: si el
- * switch no responde se aborta con error en vez de empujar el riel contra el
- * tope indefinidamente (hallazgo B2).
+ * Bloquea hasta terminar. Primer tramo: al fin de carrera negativo, que fija
+ * el origen. Segundo tramo: al positivo, contando pasos reales para medir el
+ * largo del riel en vez de asumir STEPPER_POS_LIMIT_CM a ciegas — el objetivo
+ * es caracterizar el riel, no sólo referenciarlo. La diferencia contra el
+ * valor configurado se loguea siempre; CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH
+ * decide si el límite positivo activo (el que usa stepper_move_to para
+ * acotar) pasa a ser el medido o se queda en el configurado.
  *
- * @return ESP_OK; ESP_ERR_TIMEOUT si se agotó el presupuesto de pasos;
+ * A diferencia del sketch original, que giraba en un `while (true)` sin
+ * salida, cada tramo tiene un presupuesto máximo de pasos: si el switch no
+ * responde se aborta con error en vez de empujar el riel contra el tope
+ * indefinidamente (hallazgo B2).
+ *
+ * @return ESP_OK; ESP_ERR_TIMEOUT si algún tramo agotó su presupuesto;
  *         ESP_ERR_INVALID_STATE si ambos fines de carrera están activos.
  */
 esp_err_t stepper_calibrate(void);
@@ -114,6 +125,16 @@ void stepper_set_position(int32_t steps);
 
 /** @brief True mientras quede camino por recorrer. */
 bool stepper_is_moving(void);
+
+/**
+ * @brief Límite positivo activo en pasos: medido o configurado según decidió
+ * la última stepper_calibrate() (ver CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH).
+ * Antes de calibrar, es el configurado (stepper_pos_limit_steps()).
+ */
+int32_t stepper_active_pos_limit_steps(void);
+
+/** @brief True si CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH está activo. */
+bool stepper_calib_trusts_measured(void);
 
 /** @brief Instantánea coherente de todo el estado. */
 void stepper_get_stats(stepper_stats_t *out);
