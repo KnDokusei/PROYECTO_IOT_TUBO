@@ -1,4 +1,4 @@
-p/*
+/*
  * E1-Mic - Módulo de micrófono del tubo de Kundt, port a ESP-IDF.
  *
  * Función: escuchar con el micrófono fijo en la entrada del tubo el audio que
