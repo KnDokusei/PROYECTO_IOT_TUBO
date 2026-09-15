@@ -207,7 +207,6 @@ static bool re_referenciar(void)
 static void a_idle(void)
 {
     stepper_set_speed(CONFIG_E3_SPEED_SPS);
-    publicar();
     cambiar(E3_IDLE);
 
     if (!s_mqtt_arrancado) {
@@ -217,6 +216,14 @@ static void a_idle(void)
                                          on_actuators, NULL));
         s_mqtt_arrancado = true;
     }
+
+    /* Después de arrancar el cliente, no antes: publicar sin cliente devuelve
+     * ESP_ERR_INVALID_STATE y se descarta. Aun así esta primera llamada falla,
+     * porque el enlace TCP tarda unos segundos en establecerse; quien consigue
+     * la primera medida es el publicado periódico de IDLE. Sirve para el otro
+     * camino que entra aquí: al terminar un movimiento informa la posición
+     * final sin esperar un tick. */
+    publicar();
 }
 
 /* ---- Máquina de estados -------------------------------------------------- */
@@ -297,6 +304,12 @@ static void fsm_task(void *arg)
             break;
 
         case E3_IDLE:
+            /* Se publica en reposo, no sólo al moverse. Sin esto el servidor no
+             * distingue un émbolo quieto y calibrado de una placa colgada: en
+             * ambos casos ve silencio. Es además el único camino por el que sale
+             * la primera medida, porque la de a_idle() ocurre antes de que MQTT
+             * haya terminado de conectar. */
+            publicar();
             if (xQueueReceive(s_cola, &cmd, 0) != pdTRUE) {
                 break;
             }
