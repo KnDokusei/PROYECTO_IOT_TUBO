@@ -20,7 +20,7 @@ compilable y flasheable por separado.
 |---|---|---|---|
 | [E1-Mic](E1-Mic/) | DOIT DEVKIT V1 | Micrófono → WebSocket binario | ✅ **migrado** |
 | [E2-SineGen](E2-SineGen/) | DOIT DEVKIT V1 | AD9833 + servo | ✅ **migrado** |
-| [E3-StepMotor](E3-StepMotor/) | DOIT DEVKIT V1 | A4988 + fines de carrera | ✅ **migrado** (autoprueba en placa; falta el motor real) |
+| [E3-StepMotor](E3-StepMotor/) | DOIT DEVKIT V1 | A4988 + fines de carrera | ✅ **migrado** (en validación sobre el riel real) |
 | [EC-Cameras](EC-Cameras/) | AI-Thinker ESP32-CAM | Servidor MJPEG ×3 | ⬜ esqueleto |
 
 Los cuatro módulos son **independientes entre sí**: no comparten pines ni
@@ -29,29 +29,20 @@ esqueletos ya compilan y arrancan: inicializan NVS y avisan por consola de que
 su lógica todavía no está portada.
 
 Mientras tanto, el firmware operativo de EC sigue siendo el sketch de Arduino
-del proyecto original. E3 está migrado y su autoprueba de banco pasa entera
-(21/21), pero **todavía no se ha probado sobre el motor real**: hasta entonces,
-el sketch de Arduino sigue siendo el firmware de referencia para ese módulo.
+del proyecto original.
 
-**Pendiente:** E3 ya tiene una máquina de estados explícita (INIT: calibración
-al arrancar, sin cliente MQTT arriba —el WiFi sí sube antes, para la OTA—;
-IDLE: esperando consigna; BUSY: émbolo en movimiento para el experimento
-remoto que lo está usando). Falta llevar el mismo patrón a E1 y E2, y en los
-tres reforzar la robustez de esa máquina: qué hacer ante una calibración que
-falla en caliente, y checks periódicos o entre sesiones (no sólo al arrancar)
-para detectar que el hardware se descalibró mientras el laboratorio remoto
-seguía operando.
+**E3 (émbolo):** una máquina de estados (`switch/case` en
+`E3-StepMotor/main/main.c`) calibra al arrancar, espera consignas por MQTT y
+mueve el émbolo directo a la posición pedida. Los switches son la verdad
+física: el SW derecho está a 26 cm del parlante y el SW izquierdo a 84 cm. La
+primera vez recorre el riel completo y guarda en NVS el largo en pasos; desde
+ahí, cada arranque sólo busca el SW derecho. La conversión es una recta,
+`pasos = m · cm`, con pendiente calibrada o teórica (250 pasos/cm) según cuál
+de las dos funciones `pendiente()` quede sin comentar. Todo error mayor a
+1 cm sale como WARN: largo medido vs teórico, posición alcanzada vs pedida, o
+deriva al tocar un switch. Una deriva así, además, dispara un nuevo barrido.
 
-**Caracterización del riel (E3):** la calibración recorre el riel completo
-(no sólo busca el origen) y mide el largo real contando pasos entre los dos
-fines de carrera, porque el objetivo del módulo es que la web le dé una única
-entrada —posición X— y eso exige conocer el mapeo cm↔pasos con precisión, no
-asumirlo. El largo medido se loguea siempre junto al configurado
-(`STEPPER_POS_LIMIT_CM`) y su diferencia; `CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH`
-(Kconfig, apagado por defecto) decide si ese valor medido pasa a ser el límite
-que se usa para acotar movimientos, o si sólo se informa mientras el límite
-configurado sigue mandando — a definir según lo que decida el resto del
-equipo con los primeros datos reales del riel.
+**Pendiente:** llevar el mismo patrón de máquina de estados a E1 y E2.
 
 ## Estructura
 
@@ -112,10 +103,10 @@ Los símbolos de Kconfig están definidos una sola vez, en el componente
 ## Tests
 
 ```bash
-make -C test/host        # 425 comprobaciones (E1 + E2 + E3)
+make -C test/host        # 553 comprobaciones (E1 + E2 + E3)
 make -C test/host e1     # sólo E1: conversión de muestras
 make -C test/host e2     # sólo E2: DDS, servo y parseo de la API
-make -C test/host e3     # sólo E3: geometría del riel, acotado y unidades (A3)
+make -C test/host e3     # sólo E3: recta pasos↔cm y acotado
 make -C test/host asan   # todos bajo AddressSanitizer + UBSan
 ```
 

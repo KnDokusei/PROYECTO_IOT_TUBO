@@ -4,79 +4,46 @@
 
 #include "stepper.h"
 
-#include <math.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "esp_attr.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 static const char *TAG = "stepper";
 
-/* Datasheet del A4988: STEP admite pulsos desde 1 us; se usan 2 por margen. */
+/* A4988: STEP admite pulsos desde 1 µs; se usan 2 por margen. */
 #define STEP_PULSE_US 2
-/* Margen para que DIR quede estable antes del flanco de subida de STEP. */
+/* DIR estable antes del flanco de subida de STEP. */
 #define DIR_SETUP_US 1
-/* Datasheet del A4988: 1 ms tras SLEEP alto para que estabilice el charge pump.
- * Se aplica con esp_rom_delay_us y no con vTaskDelay porque el tick por defecto
- * de FreeRTOS es de 10 ms: pdMS_TO_TICKS(1) daría cero y no esperaría nada. */
+/* A4988: 1 ms tras SLEEP en alto para el charge pump. Con esp_rom_delay_us porque
+ * el tick de FreeRTOS es de 10 ms y pdMS_TO_TICKS(1) daría cero. */
 #define A4988_WAKE_US 1200
-
-/* Margen sobre el tiempo teórico de recorrido antes de declarar fallida la
- * calibración, en porcentaje. Se expresa así y no como "3 / 2" porque una
- * macro con un operador suelto cambia de significado según el lado en que se
- * use en la multiplicación. */
-#define CALIB_TIMEOUT_PCT 150
-
-/* Barrido del segundo tramo (al fin de carrera positivo): se pide este
- * porcentaje de más sobre el recorrido nominal, por si el riel real es más
- * largo que STEPPER_POS_LIMIT_CM. */
-#define CALIB_SWEEP_MARGIN_PCT 120
-
-/* Diferencia entre el largo medido y el configurado a partir de la cual se
- * loguea una advertencia (no aborta: sólo avisa). */
-#define CALIB_LENGTH_WARN_CM 0.5f
-
-/* Un bool de Kconfig en "n" no genera macro (no hay CONFIG_X = 0, la macro
- * directamente no existe), así que sólo es seguro usarlo dentro de un `#if`.
- * Esto lo normaliza a 0/1 para poder usarlo también en expresiones C normales. */
-#ifdef CONFIG_E3_CALIB_TRUST_MEASURED_LENGTH
-#define CALIB_TRUST_MEASURED 1
-#else
-#define CALIB_TRUST_MEASURED 0
-#endif
 
 static struct {
     gptimer_handle_t timer;
     stepper_config_t cfg;
-    int32_t          min_steps;
-    int32_t          max_steps;
     int32_t          position;
     int32_t          target;
     bool             moving;
-    bool             calibrated;
-    uint32_t         endstop_stops;
-    uint64_t         steps_emitted;
+    int              hit; /* switch que detuvo el último movimiento */
     int              last_dir;
 } s;
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* Fines de carrera activos en bajo: switch a GND con pull-up externo. */
-static inline bool IRAM_ATTR endstop_pressed(int gpio)
+static inline bool IRAM_ATTR pressed(int gpio)
 {
     return gpio_get_level(gpio) == 0;
 }
 
-/* dir > 0 mueve hacia el extremo lejano al parlante. */
 static void IRAM_ATTR set_dir(int dir)
 {
-    int level = (dir > 0) ? 1 : 0;
+    int level = (dir == STEPPER_IZQ) ? 1 : 0;
     if (s.cfg.invert_dir) {
         level = !level;
     }
@@ -90,22 +57,16 @@ static void IRAM_ATTR pulse_step(void)
     gpio_set_level(s.cfg.step_gpio, 0);
 }
 
-/* Deja el movimiento terminado y duerme el driver, como hacía el sketch
- * original para que el motor no se caliente parado. Efecto secundario que el
- * README ya advierte: sin corriente no hay par de retención y el riel se puede
- * mover a mano sin que el firmware se entere. */
+/* Duerme el driver al parar para que el motor no se caliente. Sin corriente no hay
+ * par de retención: el émbolo se puede mover a mano sin que el firmware se entere. */
 static void IRAM_ATTR finish_move(void)
 {
     s.moving = false;
     gpio_set_level(s.cfg.sleep_gpio, 0);
 }
 
-/*
- * Un paso por alarma. El temporizador queda corriendo siempre: parar y arrancar
- * el GPTimer desde la ISR no es seguro, y una alarma vacía cuesta unos pocos
- * microsegundos. A 500 pasos/s eso es holgadamente menos del 1 % de CPU, a
- * cambio de que no haya carrera alguna entre arranque y parada.
- */
+/* Un paso por alarma. El GPTimer corre siempre: pararlo desde la ISR no es seguro
+ * y una alarma vacía cuesta unos microsegundos. */
 static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
                                const gptimer_alarm_event_data_t *edata,
                                void *arg)
@@ -127,24 +88,12 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
         return false;
     }
 
-    const int dir = (s.target > s.position) ? 1 : -1;
+    const int dir = (s.target > s.position) ? STEPPER_IZQ : STEPPER_DER;
+    const int sw  = (dir == STEPPER_IZQ) ? s.cfg.sw_izq_gpio : s.cfg.sw_der_gpio;
 
-    /* Los fines de carrera se comprueban en cada paso, no cada varios
-     * milisegundos: son el único límite físico y llegar tarde significa empujar
-     * el riel contra el tope. Al tocar uno, esa posición pasa a ser la verdad
-     * y se recalibra sobre ella. */
-    if (dir > 0 && endstop_pressed(s.cfg.endstop_pos_gpio)) {
-        s.position = s.max_steps;
-        s.target   = s.position;
-        s.endstop_stops++;
-        finish_move();
-        portEXIT_CRITICAL_ISR(&s_mux);
-        return false;
-    }
-    if (dir < 0 && endstop_pressed(s.cfg.endstop_neg_gpio)) {
-        s.position = s.min_steps;
-        s.target   = s.position;
-        s.endstop_stops++;
+    /* En cada paso, no cada tantos ms: el switch es el único tope físico. */
+    if (pressed(sw)) {
+        s.hit = dir;
         finish_move();
         portEXIT_CRITICAL_ISR(&s_mux);
         return false;
@@ -158,66 +107,39 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
 
     pulse_step();
     s.position += dir;
-    s.steps_emitted++;
 
     portEXIT_CRITICAL_ISR(&s_mux);
     return false;
 }
 
-static esp_err_t set_speed(uint32_t sps)
+esp_err_t stepper_set_speed(uint32_t steps_per_sec)
 {
-    if (sps == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* El temporizador cuenta a 1 MHz, así que la cuenta de alarma es el período
-     * en microsegundos. */
+    /* El temporizador cuenta a 1 MHz: la cuenta de alarma es el período en µs. */
     static gptimer_alarm_config_t alarm;
-    alarm.alarm_count                = 1000000ULL / sps;
+    alarm.alarm_count                = 1000000ULL / steps_per_sec;
     alarm.reload_count               = 0;
     alarm.flags.auto_reload_on_alarm = true;
     return gptimer_set_alarm_action(s.timer, &alarm);
 }
 
-esp_err_t stepper_init(const stepper_config_t *cfg)
+esp_err_t stepper_init(const stepper_config_t *cfg, uint32_t steps_per_sec)
 {
-    if (cfg == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     memset(&s, 0, sizeof(s));
-    s.cfg       = *cfg;
-    s.min_steps = stepper_neg_limit_steps();
-    s.max_steps = stepper_pos_limit_steps();
-    s.last_dir  = 0;
+    s.cfg = *cfg;
 
     const gpio_config_t out = {
         .pin_bit_mask = (1ULL << cfg->step_gpio) | (1ULL << cfg->dir_gpio) |
                         (1ULL << cfg->sleep_gpio),
         .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
     };
-    esp_err_t err = gpio_config(&out);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gpio_config de salidas: %s", esp_err_to_name(err));
-        return err;
-    }
+    ESP_RETURN_ON_ERROR(gpio_config(&out), TAG, "gpio_config de salidas");
 
-    /* GPIO34/35 son sólo de entrada y no admiten pull interno: el pull-up es
-     * obligatoriamente externo. Se configuran sin pull para dejarlo explícito. */
+    /* GPIO34/35 no admiten pull interno: se configuran sin pull a propósito. */
     const gpio_config_t in = {
-        .pin_bit_mask = (1ULL << cfg->endstop_pos_gpio) | (1ULL << cfg->endstop_neg_gpio),
+        .pin_bit_mask = (1ULL << cfg->sw_izq_gpio) | (1ULL << cfg->sw_der_gpio),
         .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
     };
-    err = gpio_config(&in);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gpio_config de fines de carrera: %s", esp_err_to_name(err));
-        return err;
-    }
+    ESP_RETURN_ON_ERROR(gpio_config(&in), TAG, "gpio_config de switches");
 
     gpio_set_level(cfg->sleep_gpio, 0); /* arrancar con el motor dormido */
     gpio_set_level(cfg->step_gpio, 0);
@@ -225,99 +147,36 @@ esp_err_t stepper_init(const stepper_config_t *cfg)
     const gptimer_config_t tcfg = {
         .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
         .direction     = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000, /* 1 tick = 1 us */
+        .resolution_hz = 1000000, /* 1 tick = 1 µs */
     };
-    err = gptimer_new_timer(&tcfg, &s.timer);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gptimer_new_timer: %s", esp_err_to_name(err));
-        return err;
-    }
+    ESP_RETURN_ON_ERROR(gptimer_new_timer(&tcfg, &s.timer), TAG, "gptimer_new_timer");
 
     const gptimer_event_callbacks_t cbs = { .on_alarm = on_alarm };
-    err = gptimer_register_event_callbacks(s.timer, &cbs, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gptimer_register_event_callbacks: %s", esp_err_to_name(err));
-        return err;
-    }
+    ESP_RETURN_ON_ERROR(gptimer_register_event_callbacks(s.timer, &cbs, NULL), TAG, "callbacks");
+    ESP_RETURN_ON_ERROR(stepper_set_speed(steps_per_sec), TAG, "velocidad");
+    ESP_RETURN_ON_ERROR(gptimer_enable(s.timer), TAG, "gptimer_enable");
+    ESP_RETURN_ON_ERROR(gptimer_start(s.timer), TAG, "gptimer_start");
 
-    err = set_speed(cfg->speed_sps);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "set_speed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = gptimer_enable(s.timer);
-    if (err == ESP_OK) {
-        err = gptimer_start(s.timer);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "arranque del temporizador: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    ESP_LOGI(TAG,
-             "listo: STEP=%d DIR=%d SLEEP=%d, fines %d/%d, riel %.1f-%.1f cm "
-             "(%ld pasos), %lu pasos/s",
-             cfg->step_gpio, cfg->dir_gpio, cfg->sleep_gpio,
-             cfg->endstop_neg_gpio, cfg->endstop_pos_gpio,
-             (double)STEPPER_NEG_LIMIT_CM, (double)STEPPER_POS_LIMIT_CM,
-             (long)(s.max_steps - s.min_steps), (unsigned long)cfg->speed_sps);
+    ESP_LOGI(TAG, "listo: STEP=%d DIR=%d SLEEP=%d, SW izq=GPIO%d, SW der=GPIO%d",
+             cfg->step_gpio, cfg->dir_gpio, cfg->sleep_gpio, cfg->sw_izq_gpio, cfg->sw_der_gpio);
     return ESP_OK;
 }
 
-stepper_endstops_t stepper_read_endstops(void)
+void stepper_move_to(int32_t target)
 {
-    stepper_endstops_t es = {
-        .pos_pressed = endstop_pressed(s.cfg.endstop_pos_gpio),
-        .neg_pressed = endstop_pressed(s.cfg.endstop_neg_gpio),
-    };
-    return es;
-}
-
-esp_err_t stepper_move_to(int32_t target_steps)
-{
-    /*
-     * Los dos fines de carrera activos a la vez es físicamente imposible en un
-     * riel real: significa cableado roto o pull-ups ausentes. Sin esta guardia,
-     * la ISR trataría el primer paso como llegada a un extremo y "recalibraría"
-     * la posición saltando a ese límite, con lo que el émbolo quedaría dando
-     * tumbos entre 26 y 84 cm sin moverse. Mejor negarse a mover.
-     */
-    const stepper_endstops_t es = stepper_read_endstops();
-    if (es.pos_pressed && es.neg_pressed) {
-        static bool avisado;
-        if (!avisado) {
-            avisado = true;
-            ESP_LOGE(TAG, "ambos fines de carrera activos: no se mueve el motor.");
-            ESP_LOGE(TAG, "revisa los pull-ups externos de GPIO%d y GPIO%d.",
-                     s.cfg.endstop_neg_gpio, s.cfg.endstop_pos_gpio);
-        }
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    target_steps = stepper_clamp_steps(target_steps, s.min_steps, s.max_steps);
-
     portENTER_CRITICAL(&s_mux);
-    s.target          = target_steps;
-    const bool arrived = (s.position == target_steps);
+    s.target = target;
+    s.hit    = 0;
     portEXIT_CRITICAL(&s_mux);
 
-    if (arrived) {
-        stepper_stop();
-        return ESP_OK;
-    }
-
-    /* Despertar el driver y esperar el charge pump ANTES de habilitar los
-     * pasos. El sketch original ponía SLEEP en alto y daba pasos en la misma
-     * iteración, así que los primeros de cada arranque se perdían: deriva
-     * acumulativa que descalibraba el riel en silencio (hallazgo M2). */
+    /* Despertar el driver y esperar el charge pump ANTES de habilitar los pasos:
+     * si no, se pierden los primeros de cada arranque (hallazgo M2). */
     gpio_set_level(s.cfg.sleep_gpio, 1);
     esp_rom_delay_us(A4988_WAKE_US);
 
     portENTER_CRITICAL(&s_mux);
     s.moving = true;
     portEXIT_CRITICAL(&s_mux);
-    return ESP_OK;
 }
 
 void stepper_stop(void)
@@ -347,19 +206,6 @@ void stepper_set_position(int32_t steps)
     gpio_set_level(s.cfg.sleep_gpio, 0);
 }
 
-int32_t stepper_active_pos_limit_steps(void)
-{
-    portENTER_CRITICAL(&s_mux);
-    const int32_t m = s.max_steps;
-    portEXIT_CRITICAL(&s_mux);
-    return m;
-}
-
-bool stepper_calib_trusts_measured(void)
-{
-    return CALIB_TRUST_MEASURED;
-}
-
 bool stepper_is_moving(void)
 {
     portENTER_CRITICAL(&s_mux);
@@ -368,165 +214,16 @@ bool stepper_is_moving(void)
     return m;
 }
 
-void stepper_get_stats(stepper_stats_t *out)
+int stepper_switch_hit(void)
 {
-    if (out == NULL) {
-        return;
-    }
     portENTER_CRITICAL(&s_mux);
-    out->position_steps = s.position;
-    out->target_steps   = s.target;
-    out->min_steps      = s.min_steps;
-    out->max_steps      = s.max_steps;
-    out->moving         = s.moving;
-    out->calibrated     = s.calibrated;
-    out->endstop_stops  = s.endstop_stops;
-    out->steps_emitted  = s.steps_emitted;
+    const int h = s.hit;
     portEXIT_CRITICAL(&s_mux);
+    return h;
 }
 
-/*
- * Mueve hacia `target` y espera a que termine, por fin de carrera o timeout.
- * `budget_steps` es la distancia de referencia para el presupuesto de tiempo
- * (con margen CALIB_TIMEOUT_PCT) — puede ser mayor a la distancia real si se
- * está dejando margen para un riel más largo de lo asumido. `*by_endstop`
- * queda en true sólo si lo que detuvo el movimiento fue un fin de carrera.
- */
-static esp_err_t home_leg(int32_t target, int32_t budget_steps, bool *by_endstop)
+void stepper_read_switches(bool *izq, bool *der)
 {
-    portENTER_CRITICAL(&s_mux);
-    const uint32_t hits_before = s.endstop_stops;
-    portEXIT_CRITICAL(&s_mux);
-
-    esp_err_t err = stepper_move_to(target);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const int64_t budget_us = (int64_t)budget_steps * 1000000 / s.cfg.calib_speed_sps
-                              * CALIB_TIMEOUT_PCT / 100;
-    const int64_t deadline = esp_timer_get_time() + budget_us;
-
-    while (stepper_is_moving()) {
-        if (esp_timer_get_time() > deadline) {
-            stepper_stop();
-            ESP_LOGE(TAG, "la calibración excedió %lld s sin alcanzar el fin de carrera",
-                     (long long)(budget_us / 1000000));
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    portENTER_CRITICAL(&s_mux);
-    *by_endstop = (s.endstop_stops != hits_before);
-    portEXIT_CRITICAL(&s_mux);
-    return ESP_OK;
-}
-
-esp_err_t stepper_calibrate(void)
-{
-    const stepper_endstops_t es = stepper_read_endstops();
-    if (es.pos_pressed && es.neg_pressed) {
-        ESP_LOGE(TAG, "ambos fines de carrera dan pulsado a la vez.");
-        ESP_LOGE(TAG, "GPIO%d y GPIO%d no tienen pull interno: revisa los "
-                      "pull-ups externos a 3V3 antes de mover el motor.",
-                 s.cfg.endstop_neg_gpio, s.cfg.endstop_pos_gpio);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const int32_t nominal_travel = s.max_steps - s.min_steps;
-
-    esp_err_t err = set_speed(s.cfg.calib_speed_sps);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    /* Tramo 1: al negativo, que fija el origen. Se parte suponiendo el émbolo
-     * en el extremo lejano, el caso peor: así el recorrido comandado cubre el
-     * riel completo venga de donde venga. */
-    portENTER_CRITICAL(&s_mux);
-    s.position = s.max_steps;
-    portEXIT_CRITICAL(&s_mux);
-
-    ESP_LOGI(TAG, "calibrando: buscando el fin de carrera de %.1f cm...",
-             (double)STEPPER_NEG_LIMIT_CM);
-
-    bool neg_hit = false;
-    err = home_leg(s.min_steps, nominal_travel, &neg_hit);
-    if (err != ESP_OK) {
-        set_speed(s.cfg.speed_sps);
-        return err;
-    }
-    if (!neg_hit) {
-        set_speed(s.cfg.speed_sps);
-        ESP_LOGE(TAG, "recorrido completo sin detectar el fin de carrera: "
-                      "revisa el cableado de GPIO%d", s.cfg.endstop_neg_gpio);
-        return ESP_ERR_TIMEOUT;
-    }
-
-    /* Tramo 2: barrido completo hasta el positivo, para MEDIR el largo real
-     * del riel (contando pasos) en vez de asumir STEPPER_POS_LIMIT_CM a
-     * ciegas — es la caracterización que motiva este barrido. Se pide un
-     * margen extra sobre lo nominal por si el riel real es más largo; para
-     * eso hay que correr el límite activo (`s.max_steps`) temporalmente para
-     * que stepper_move_to no acote el destino a lo ya configurado. */
-    ESP_LOGI(TAG, "calibrando: barriendo hasta el fin de carrera de %.1f cm...",
-             (double)STEPPER_POS_LIMIT_CM);
-
-    const int32_t sweep_budget = nominal_travel * CALIB_SWEEP_MARGIN_PCT / 100;
-
-    portENTER_CRITICAL(&s_mux);
-    const int32_t configured_max = s.max_steps;
-    s.max_steps = s.min_steps + sweep_budget;
-    const uint64_t steps_before = s.steps_emitted;
-    portEXIT_CRITICAL(&s_mux);
-
-    bool pos_hit = false;
-    err = home_leg(s.min_steps + sweep_budget, sweep_budget, &pos_hit);
-    set_speed(s.cfg.speed_sps);
-
-    portENTER_CRITICAL(&s_mux);
-    const uint64_t steps_after = s.steps_emitted;
-    s.max_steps = configured_max; /* se recalcula abajo con el valor definitivo */
-    portEXIT_CRITICAL(&s_mux);
-
-    if (err != ESP_OK) {
-        return err;
-    }
-    if (!pos_hit) {
-        ESP_LOGE(TAG, "recorrido completo sin detectar el fin de carrera: "
-                      "revisa el cableado de GPIO%d", s.cfg.endstop_pos_gpio);
-        return ESP_ERR_TIMEOUT;
-    }
-
-    const int32_t measured_travel = (int32_t)(steps_after - steps_before);
-    const float   measured_cm     = stepper_steps_to_cm(measured_travel);
-    const float   configured_cm   = (float)STEPPER_POS_LIMIT_CM - (float)STEPPER_NEG_LIMIT_CM;
-    const float   diff_cm         = measured_cm - configured_cm;
-
-    ESP_LOGI(TAG, "largo medido: %.2f cm (configurado: %.2f cm, diferencia: %+.2f cm)",
-             (double)measured_cm, (double)configured_cm, (double)diff_cm);
-    if (fabsf(diff_cm) > CALIB_LENGTH_WARN_CM) {
-        ESP_LOGW(TAG, "el largo medido difiere del configurado en más de %.1f cm: "
-                      "revisa STEPPER_POS_LIMIT_CM o el estado mecánico del riel.",
-                 (double)CALIB_LENGTH_WARN_CM);
-    }
-
-    const int32_t measured_max_steps = s.min_steps + measured_travel;
-
-    portENTER_CRITICAL(&s_mux);
-    s.position = measured_max_steps; /* ahí quedó el émbolo, de verdad */
-#if CALIB_TRUST_MEASURED
-    s.max_steps = measured_max_steps;
-#else
-    s.max_steps = stepper_pos_limit_steps();
-#endif
-    s.calibrated = true;
-    portEXIT_CRITICAL(&s_mux);
-
-    ESP_LOGI(TAG, "calibrado: origen en %.2f cm, límite positivo activo en %.2f cm (%s)",
-             (double)STEPPER_NEG_LIMIT_CM, (double)stepper_steps_to_cm(s.max_steps),
-             CALIB_TRUST_MEASURED ? "medido" : "configurado");
-
-    return ESP_OK;
+    *izq = pressed(s.cfg.sw_izq_gpio);
+    *der = pressed(s.cfg.sw_der_gpio);
 }

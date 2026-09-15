@@ -1,26 +1,5 @@
 menu "E3-StepMotor module"
 
-choice E3_EMBOLO_UNIT
-    prompt "Unidad de 'valores.embolo' en la respuesta del servidor"
-    default E3_EMBOLO_UNIT_MM
-    help
-      Hallazgo A3 de la auditoría. El sketch de Arduino dividía por 10 el valor
-      leído (interpretando milímetros) pero enviaba centímetros en el PUT. Las
-      claves JSON son distintas, así que la asimetría puede ser intencional;
-      sólo el código del backend lo resuelve.
-
-      Si el servidor hace round-trip (guarda 'posicion' y la sirve como
-      'embolo'), la opción MM hace que el émbolo colapse hacia el origen
-      dividiéndose por 10 en cada ciclo. Mantener MM mientras no se confirme:
-      es el comportamiento que hoy corre en los equipos.
-
-    config E3_EMBOLO_UNIT_MM
-        bool "Milimetros (comportamiento actual de Arduino)"
-
-    config E3_EMBOLO_UNIT_CM
-        bool "Centimetros (simetrico con el PUT)"
-endchoice
-
 config E3_SPEED_SPS
     int "Velocidad del motor en pasos por segundo"
     range 50 2000
@@ -29,74 +8,11 @@ config E3_SPEED_SPS
       500 pasos/s equivalen a 2 cm/s con el riel de 0,8 cm por revolucion.
 
 config E3_CALIB_SPEED_SPS
-    int "Velocidad de calibracion en pasos por segundo"
+    int "Velocidad de busqueda de switches en pasos por segundo"
     range 50 1000
     default 300
     help
-      Mas lenta que la de marcha porque la calibracion avanza a proposito
-      contra un tope mecanico.
-
-config E3_SELFTEST
-    bool "Autoprueba de banco al arrancar (sin motor ni riel)"
-    default n
-    help
-      Ejercita el generador de pasos contando los pulsos de STEP con el
-      periferico PCNT del propio chip, enrutado internamente: no hace falta
-      ningun cable. Comprueba ademas la polaridad de DIR, el manejo de SLEEP,
-      el acotado al riel y que la calibracion falle de forma segura sin fines
-      de carrera. Compilar sin esto para produccion.
-
-config E3_SELFTEST_ENDSTOP_SIM
-    bool "Simular los fines de carrera con dos GPIO (requiere 2 puentes)"
-    default n
-    depends on E3_SELFTEST
-    help
-      Gobierna GPIO34 y GPIO35 desde dos salidas del propio chip, de modo que
-      la autoprueba pueda declararlos libres (nivel alto) o pulsados (bajo).
-
-      Cableado:  GPIO26 -> GPIO34   y   GPIO27 -> GPIO35
-
-      Sin esto, GPIO34/35 quedan al aire, leen pulsado y el firmware se niega
-      a mover el motor, asi que no se puede medir el generador de pasos.
-      Con esto se prueban ademas el corte por fin de carrera a mitad de
-      movimiento y la calibracion completa.
-
-config E3_SELFTEST_SIM_POS_GPIO
-    int "GPIO que simula el fin de carrera + (va a GPIO34)"
-    default 26
-    depends on E3_SELFTEST_ENDSTOP_SIM
-
-config E3_SELFTEST_SIM_NEG_GPIO
-    int "GPIO que simula el fin de carrera - (va a GPIO35)"
-    default 27
-    depends on E3_SELFTEST_ENDSTOP_SIM
-
-config E3_SELFTEST_STEPS
-    int "Pasos por movimiento de prueba"
-    range 100 20000
-    default 1000
-    depends on E3_SELFTEST
-    help
-      1000 pasos son 4 cm de riel y unos 2 s a 500 pasos/s.
-
-config E3_CALIB_TRUST_MEASURED_LENGTH
-    bool "Usar el largo medido (no STEPPER_POS_LIMIT_CM) como limite positivo activo"
-    default n
-    help
-      La calibracion ahora recorre el riel completo (no solo el origen) y mide
-      el largo real contando pasos entre los dos fines de carrera. Con esta
-      opcion apagada (por defecto) ese valor medido solo se informa por log,
-      comparado contra STEPPER_POS_LIMIT_CM, y el limite que se usa para
-      acotar movimientos sigue siendo el configurado. Con esta opcion prendida,
-      el limite positivo activo pasa a ser el medido en esa pasada. En ambos
-      casos la posicion informada despues de calibrar es la real.
-
-config E3_SKIP_CALIBRATION
-    bool "Omitir la calibracion al arrancar (solo banco de pruebas)"
-    default n
-    help
-      Sin riel ni fines de carrera la calibracion falla por diseno. Activar
-      esto permite probar la parte de red en una placa pelada. NO usar en un
-      equipo real: la posicion informada no tendra ninguna referencia fisica.
+      Mas lenta que la de marcha porque la busqueda avanza a proposito
+      contra un switch.
 
 endmenu
