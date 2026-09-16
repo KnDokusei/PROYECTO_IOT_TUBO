@@ -12,9 +12,9 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 # las tablas por defecto.
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
-# Labfisica no anuncia su SSID. Esta opción permite conectar a APs ocultos
-# mediante escaneo pasivo cuando la política de país es automática; viene
-# desactivada de fábrica.
+# La red del laboratorio no anuncia su SSID. Esta opción permite conectar a APs
+# ocultos mediante escaneo pasivo cuando la política de país es automática;
+# viene desactivada de fábrica.
 CONFIG_ESP_WIFI_PASSIVE_HIDDEN_AP_SUPPORT=y
 
 # El servidor HTTP sostiene la conexión del stream mientras haya cliente.
