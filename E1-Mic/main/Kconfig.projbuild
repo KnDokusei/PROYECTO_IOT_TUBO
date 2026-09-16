@@ -27,32 +27,4 @@ menu "E1-Mic module"
             knob for that trade-off, so change this rather than adding a
             separate rate limit.
 
-
-    config E1_SELFTEST_DAC
-        bool "Enable DAC loopback self-test"
-        default n
-        help
-            Drives the ESP32 cosine-wave generator on a DAC pin so the board can
-            feed its own ADC a known tone, with no external instrument. Requires
-            a jumper wire from the DAC pin to the ADC input (GPIO34).
-
-            Leave this OFF for the real module: GPIO25 is not connected to
-            anything in the Kundt schematic.
-
-    config E1_SELFTEST_DAC_GPIO25
-        bool "Use GPIO25 (DAC channel 0)"
-        depends on E1_SELFTEST_DAC
-        default y
-        help
-            GPIO25 is DAC channel 0, GPIO26 is channel 1. Unset to use GPIO26.
-
-    config E1_SELFTEST_DAC_FREQ
-        int "Self-test tone frequency (Hz)"
-        depends on E1_SELFTEST_DAC
-        range 130 20000
-        default 1200
-        help
-            1200 Hz matches the AD9833 default of module E2. The RTC-driven
-            cosine generator cannot go below about 130 Hz.
-
 endmenu
