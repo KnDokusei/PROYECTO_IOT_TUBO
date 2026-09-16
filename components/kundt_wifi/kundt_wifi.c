@@ -143,6 +143,19 @@ esp_err_t kundt_wifi_connect(const char *ssid, const char *password)
     strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
     cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  /* Acepta APs abiertos y cifrados. */
 
+    /*
+     * Se barren todos los canales en vez de parar en el primer AP que responda.
+     * WIFI_FAST_SCAN, que es el valor por defecto, termina "after find SSID
+     * match AP": con una red que no anuncia su SSID eso depende de que la sonda
+     * dirigida caiga en el canal correcto pronto. Barrer entero cuesta unos
+     * segundos más en el primer arranque y quita esa dependencia.
+     *
+     * De paso, con un AP de doble banda que repite SSID en varios canales, esto
+     * elige el de mejor señal en lugar del primero que conteste.
+     */
+    cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
