@@ -1,207 +1,360 @@
 /*
- * E3-StepMotor - Módulo del motor paso a paso del tubo de Kundt, port a ESP-IDF.
+ * E3-StepMotor - Émbolo motorizado del tubo de Kundt.
  *
- * Función (según el README del proyecto): mover el émbolo por el riel hasta la
- * posición que pide el servidor, respetando los dos fines de carrera, e
- * informar de vuelta la posición real para que el usuario remoto la vea.
+ * MQTT manda la posición objetivo en cm; el émbolo va directo ahí y se informa
+ * la posición alcanzada y el error.
  *
- * Cadena de control: consigna por MQTT -> pasos -> A4988 -> motor -> riel,
- *                    y publicación de la posición alcanzada y los topes.
+ *   parlante            SW derecho                   SW izquierdo
+ *     0 cm --------------- 26 cm ======== riel ======== 84 cm
+ *                          STEPPER_DER <--------> STEPPER_IZQ
  *
- * Portado del sketch de Arduino. Se conservan las funcionalidades; se corrigen
- * los hallazgos de la auditoría que el port permite cerrar, cada uno marcado
- * con su ID.
+ * Todo el cálculo es en pasos. La única conversión es la recta pasos = m · cm,
+ * al recibir la consigna y al publicar. Los switches son la verdad física.
+ *
+ * Una sola tarea, fsm_task, corre la máquina de estados:
+ *
+ *   INIT        -> REFERENCIA   hay span guardado en NVS
+ *   INIT        -> BARRIDO_IZQ  no hay span
+ *   BARRIDO_IZQ -> BARRIDO_DER  tocó SW izq (posición := 0)
+ *   BARRIDO_DER -> IDLE         tocó SW der: span medido y guardado
+ *   REFERENCIA  -> IDLE         tocó SW der
+ *   IDLE        -> MOVIENDO     llegó una consigna
+ *   MOVIENDO    -> IDLE         llegó, o se cayó el WiFi
+ *   MOVIENDO    -> BARRIDO_IZQ  tocó un switch con deriva > ERROR_MAX_CM
+ *   búsquedas   -> FALLA        el motor paró sin tocar el switch buscado
+ *   cualquiera  -> FALLA        ambos switches pulsados a la vez
  */
 
-#include <stdio.h>
+#include <math.h>
 
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
 #include "freertos/queue.h"
+#include "freertos/task.h"
+#include "nvs.h"
 
 #include "kundt_config.h"
 #include "kundt_led.h"
 #include "kundt_mqtt.h"
 #include "kundt_wifi.h"
-#include "selftest.h"
 #include "stepper.h"
+#include "stepper_math.h"
 
 static const char *TAG = "E3-StepMotor";
 
-/*
- * Ya no hay sondeo: la consigna llega empujada por MQTT. Este intervalo es el
- * ritmo con que se revisa el estado del motor y se informa la posición, y se
- * mantiene en los 500 ms del sketch original porque marca la resolución
- * temporal con que el usuario remoto ve avanzar el émbolo.
- */
-#define TICK_INTERVAL_MS 500
+#define TICK_MS         500   /* ritmo de la FSM y de la publicación */
+#define ERROR_MAX_CM    1.0f  /* sobre esto: WARN, y en deriva además re-barrido */
+#define BUSQUEDA_PASOS  29000 /* 2 rieles teóricos: sin switch en ese tramo, FALLA */
+#define LOG_FALLA_TICKS 30    /* 15 s */
 
-/* Cadencia del log de avance. */
-#define STATS_INTERVAL_MS 15000
+typedef enum {
+    E3_INIT,
+    E3_BARRIDO_IZQ,
+    E3_BARRIDO_DER,
+    E3_REFERENCIA,
+    E3_IDLE,
+    E3_MOVIENDO,
+    E3_FALLA,
+} estado_t;
 
-#if CONFIG_E3_EMBOLO_UNIT_CM
-#define EMBOLO_UNIT STEPPER_INPUT_CM
-#else
-#define EMBOLO_UNIT STEPPER_INPUT_MM
-#endif
+static const char *const NOMBRE[] = {
+    [E3_INIT]        = "INIT",
+    [E3_BARRIDO_IZQ] = "BARRIDO_IZQ",
+    [E3_BARRIDO_DER] = "BARRIDO_DER",
+    [E3_REFERENCIA]  = "REFERENCIA",
+    [E3_IDLE]        = "IDLE",
+    [E3_MOVIENDO]    = "MOVIENDO",
+    [E3_FALLA]       = "FALLA",
+};
 
-/*
- * Cola de una entrada, sobrescribible. El callback de MQTT corre en la tarea de
- * eventos del cliente y mover el motor puede tardar segundos, así que aquí sólo
- * se anota el destino. Si llegan varios mientras el émbolo se desplaza, el que
- * vale es el último: encolarlos todos haría recorrer posiciones que nadie pidió.
- */
-static QueueHandle_t s_cmd_queue;
+static estado_t       s_estado = E3_INIT;
+static int32_t        s_span;   /* pasos entre SW izq y SW der; 0 = sin calibrar */
+static int32_t        s_pedido; /* pasos que pidió la última consigna, sin acotar */
+static QueueHandle_t  s_cola;
+static kundt_config_t s_cfg;
+static bool           s_mqtt_arrancado;
 
+/* Pendiente m [pasos/cm] de la recta pasos = m · cm. Dejar UNA sin comentar. */
+static float pendiente(void) { return (float)s_span / (STEPPER_SW_IZQ_CM - STEPPER_SW_DER_CM); } /* calibrada */
+// static float pendiente(void) { return STEPPER_STEPS_PER_CM_TEORICO; }                           /* teórica: 250 */
+
+static int32_t pasos_sw_der(void) { return stepper_cm_to_steps(STEPPER_SW_DER_CM, pendiente()); }
+static int32_t pasos_sw_izq(void) { return stepper_cm_to_steps(STEPPER_SW_IZQ_CM, pendiente()); }
+
+static int32_t span_teorico(void)
+{
+    return stepper_cm_to_steps(STEPPER_SW_IZQ_CM - STEPPER_SW_DER_CM, STEPPER_STEPS_PER_CM_TEORICO);
+}
+
+/* ---- NVS: el span sobrevive a los reinicios ------------------------------ */
+
+static int32_t span_cargar(void)
+{
+    int32_t      span = 0;
+    nvs_handle_t h;
+    if (nvs_open("e3", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "span", &span);
+        nvs_close(h);
+    }
+    /* Un valor absurdo (flash corrupta, otro riel) cuenta como ausente. */
+    if (span < span_teorico() / 2 || span > span_teorico() * 3 / 2) {
+        return 0;
+    }
+    return span;
+}
+
+static void span_guardar(int32_t span)
+{
+    nvs_handle_t h;
+    if (nvs_open("e3", NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "no se pudo abrir NVS: el span no queda guardado");
+        return;
+    }
+    nvs_set_i32(h, "span", span);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* ---- MQTT ---------------------------------------------------------------- */
+
+/* Corre en la tarea de eventos de esp_mqtt_client: sólo anota. Vale la última. */
 static void on_actuators(const kundt_mqtt_actuators_t *act, void *ctx)
 {
     (void)ctx;
     if (act->has_plunger_pos) {
-        xQueueOverwrite(s_cmd_queue, act);
+        xQueueOverwrite(s_cola, act);
     }
 }
 
-static void control_task(void *arg)
+static void publicar(void)
+{
+    bool izq, der;
+    stepper_read_switches(&izq, &der);
+    const kundt_mqtt_sensors_t m = {
+        .plunger_actual  = stepper_steps_to_cm(stepper_position(), pendiente()),
+        .has_plunger_actual  = true,
+        .clockwise_limit = izq, .has_clockwise_limit = true,
+        .counter_limit   = der, .has_counter_limit   = true,
+    };
+    kundt_mqtt_publish(&m, NULL); /* sin conexión no se encola: se ignora */
+}
+
+/* ---- Ayudantes de la FSM ------------------------------------------------- */
+
+static void cambiar(estado_t nuevo)
+{
+    ESP_LOGI(TAG, "%s -> %s", NOMBRE[s_estado], NOMBRE[nuevo]);
+    s_estado = nuevo;
+}
+
+/* Loguea un error; WARN si supera ERROR_MAX_CM. Devuelve true si lo supera. */
+static bool reportar_error(const char *que, int32_t pasos, float cm)
+{
+    const bool excede = fabsf(cm) > ERROR_MAX_CM;
+    if (excede) {
+        ESP_LOGW(TAG, "%s: %ld pasos (%+.2f cm), supera %.1f cm",
+                 que, (long)pasos, (double)cm, (double)ERROR_MAX_CM);
+    } else {
+        ESP_LOGI(TAG, "%s: %ld pasos (%+.2f cm)", que, (long)pasos, (double)cm);
+    }
+    return excede;
+}
+
+/* Busca un switch a velocidad lenta. BUSQUEDA_PASOS es el presupuesto, no el destino. */
+static void buscar(int dir)
+{
+    stepper_set_speed(CONFIG_E3_CALIB_SPEED_SPS);
+    stepper_move_to(stepper_position() + dir * BUSQUEDA_PASOS);
+}
+
+/* True si la búsqueda terminó sin tocar el switch buscado. */
+static bool sin_switch(int dir)
+{
+    if (stepper_switch_hit() == dir) {
+        return false;
+    }
+    ESP_LOGE(TAG, "%d pasos sin tocar el SW %s: revisa el switch y su cableado",
+             BUSQUEDA_PASOS, (dir == STEPPER_IZQ) ? "izquierdo" : "derecho");
+    return true;
+}
+
+static void mover(float cm)
+{
+    s_pedido = stepper_cm_to_steps(cm, pendiente());
+    const int32_t destino = stepper_clamp_steps(s_pedido, pasos_sw_der(), pasos_sw_izq());
+    ESP_LOGI(TAG, "consigna %.2f cm -> %ld pasos (desde %ld)",
+             (double)cm, (long)destino, (long)stepper_position());
+    stepper_move_to(destino);
+}
+
+/* Si el movimiento paró en un switch, ese switch manda: se mide la deriva y se
+ * re-referencia. Devuelve true si la deriva exige volver a barrer. */
+static bool re_referenciar(void)
+{
+    const int hit = stepper_switch_hit();
+    if (hit == 0) {
+        return false;
+    }
+    const int32_t esperado = (hit == STEPPER_IZQ) ? pasos_sw_izq() : pasos_sw_der();
+    const int32_t deriva   = stepper_position() - esperado;
+    stepper_set_position(esperado);
+    return reportar_error("deriva al tocar el switch", deriva,
+                          stepper_steps_to_cm(deriva, pendiente()));
+}
+
+/* IDLE es el primer estado que acepta consignas: MQTT arranca recién aquí para
+ * que ninguna compita con la calibración por el motor. */
+static void a_idle(void)
+{
+    stepper_set_speed(CONFIG_E3_SPEED_SPS);
+    cambiar(E3_IDLE);
+
+    if (!s_mqtt_arrancado) {
+        char broker[48];
+        ESP_ERROR_CHECK(kundt_config_broker_uri(broker, sizeof(broker)));
+        ESP_ERROR_CHECK(kundt_mqtt_start(broker, s_cfg.platform_id, s_cfg.controller_id,
+                                         on_actuators, NULL));
+        s_mqtt_arrancado = true;
+    }
+
+    /* Después de arrancar el cliente, no antes: publicar sin cliente devuelve
+     * ESP_ERR_INVALID_STATE y se descarta. Aun así esta primera llamada falla,
+     * porque el enlace TCP tarda unos segundos en establecerse; quien consigue
+     * la primera medida es el publicado periódico de IDLE. Sirve para el otro
+     * camino que entra aquí: al terminar un movimiento informa la posición
+     * final sin esperar un tick. */
+    publicar();
+}
+
+/* ---- Máquina de estados -------------------------------------------------- */
+
+static void fsm_task(void *arg)
 {
     (void)arg;
-
-    int32_t  last_target = INT32_MIN;
-    int32_t  last_warned = INT32_MIN; /* evita repetir el aviso de acotado */
-    bool     was_moving  = false;
-    uint32_t applied = 0, pub_failed = 0;
-    int64_t  last_stats = 0;
-
-    ESP_LOGI(TAG, "lazo de control iniciado (tick de %d ms)", TICK_INTERVAL_MS);
+    kundt_mqtt_actuators_t cmd;
+    uint32_t ticks = 0;
 
     for (;;) {
-        kundt_mqtt_actuators_t cmd;
+        vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+        ticks++;
 
-        /* Se espera con tiempo límite en vez de dormir en seco: una consigna se
-         * atiende al instante y el vencimiento marca el ritmo del reporte. El
-         * sketch original giraba a 100 % de CPU en el núcleo 0 durante estos
-         * 500 ms, dejando hambrienta a la tarea IDLE que alimenta el watchdog
-         * (hallazgo M3). */
-        const bool got = xQueueReceive(s_cmd_queue, &cmd,
-                                       pdMS_TO_TICKS(TICK_INTERVAL_MS)) == pdTRUE;
+        bool izq, der;
+        stepper_read_switches(&izq, &der);
+        if (izq && der && s_estado != E3_FALLA) {
+            ESP_LOGE(TAG, "ambos switches pulsados: cableado roto o faltan los pull-ups a 3V3");
+            stepper_stop();
+            cambiar(E3_FALLA);
+        }
 
-        if (!kundt_wifi_is_connected()) {
-            /* El README promete que el motor se detiene mientras no haya red. */
+        switch (s_estado) {
+        case E3_INIT:
+            s_span = span_cargar();
+            if (s_span > 0) {
+                ESP_LOGI(TAG, "span guardado: %ld pasos", (long)s_span);
+                buscar(STEPPER_DER);
+                cambiar(E3_REFERENCIA);
+            } else {
+                ESP_LOGI(TAG, "sin span guardado: barrido completo");
+                buscar(STEPPER_IZQ);
+                cambiar(E3_BARRIDO_IZQ);
+            }
+            break;
+
+        case E3_BARRIDO_IZQ:
             if (stepper_is_moving()) {
+                break;
+            }
+            if (sin_switch(STEPPER_IZQ)) {
+                cambiar(E3_FALLA);
+                break;
+            }
+            stepper_set_position(0);
+            buscar(STEPPER_DER);
+            cambiar(E3_BARRIDO_DER);
+            break;
+
+        case E3_BARRIDO_DER:
+            if (stepper_is_moving()) {
+                break;
+            }
+            if (sin_switch(STEPPER_DER)) {
+                cambiar(E3_FALLA);
+                break;
+            }
+            s_span = -stepper_position();
+            span_guardar(s_span);
+            ESP_LOGI(TAG, "span medido: %ld pasos, pendiente activa %.2f pasos/cm",
+                     (long)s_span, (double)pendiente());
+            reportar_error("largo medido - teórico", s_span - span_teorico(),
+                           stepper_steps_to_cm(s_span - span_teorico(), STEPPER_STEPS_PER_CM_TEORICO));
+            stepper_set_position(pasos_sw_der());
+            a_idle();
+            break;
+
+        case E3_REFERENCIA:
+            if (stepper_is_moving()) {
+                break;
+            }
+            if (sin_switch(STEPPER_DER)) {
+                cambiar(E3_FALLA);
+                break;
+            }
+            stepper_set_position(pasos_sw_der());
+            a_idle();
+            break;
+
+        case E3_IDLE:
+            /* Se publica en reposo, no sólo al moverse. Sin esto el servidor no
+             * distingue un émbolo quieto y calibrado de una placa colgada: en
+             * ambos casos ve silencio. Es además el único camino por el que sale
+             * la primera medida, porque la de a_idle() ocurre antes de que MQTT
+             * haya terminado de conectar. */
+            publicar();
+            if (xQueueReceive(s_cola, &cmd, 0) != pdTRUE) {
+                break;
+            }
+            mover(cmd.plunger_pos);
+            cambiar(E3_MOVIENDO);
+            break;
+
+        case E3_MOVIENDO:
+            if (xQueueReceive(s_cola, &cmd, 0) == pdTRUE) {
+                mover(cmd.plunger_pos);
+            }
+            if (!kundt_wifi_is_connected()) {
                 ESP_LOGW(TAG, "sin WiFi: se detiene el motor");
                 stepper_stop();
             }
-            kundt_led_set_state(KUNDT_LED_NO_WIFI);
-            continue;
-        }
-        if (!kundt_mqtt_is_connected()) {
-            /* Se conserva la última consigna en vez de caer a cero, que es lo
-             * que hacía la versión Arduino ante un 404 o un JSON ilegible
-             * (hallazgo A4). Aquí caer a cero mandaría el émbolo contra el
-             * tope. El motor sigue hacia donde iba: perder el broker no es
-             * perder la red, y detenerse a media carrera deja el émbolo en una
-             * posición que nadie pidió. */
-            kundt_led_set_state(KUNDT_LED_NO_SERVER);
-            continue;
-        }
-
-        kundt_led_set_state(KUNDT_LED_RUNNING);
-
-        if (got) {
-            /* El contrato de curiousBeagle fija plunger_pos en centímetros, y
-             * queda escrito en el DTO del servidor. Esa es la diferencia con el
-             * hallazgo A3: el servidor viejo nunca documentó la unidad, y aquí
-             * no hay nada que deducir. */
-            const float   want_cm = cmd.plunger_pos;
-            const int32_t want    = stepper_clamp_steps(stepper_cm_to_steps(want_cm),
-                                                        stepper_neg_limit_steps(),
-                                                        stepper_pos_limit_steps());
-
-            /* El aviso se emite al cambiar la petición, no en cada consulta:
-             * un backend que insiste en un valor fuera de rango llenaría el log
-             * dos veces por segundo sin aportar nada nuevo. */
-            if (!stepper_cm_in_range(want_cm) && want != last_warned) {
-                ESP_LOGW(TAG, "posición %.2f cm fuera del riel [%.1f, %.1f], acotada a %.2f cm",
-                         (double)want_cm,
-                         (double)STEPPER_NEG_LIMIT_CM, (double)STEPPER_POS_LIMIT_CM,
-                         (double)stepper_steps_to_cm(want));
-                last_warned = want;
+            publicar();
+            if (stepper_is_moving()) {
+                break;
             }
-
-            if (want != last_target) {
-                if (stepper_move_to(want) == ESP_OK) {
-                    ESP_LOGI(TAG, "destino -> %.2f cm (%ld pasos), desde %.2f cm",
-                             (double)stepper_steps_to_cm(want), (long)want,
-                             (double)stepper_steps_to_cm(stepper_position()));
-                    last_target = want;
-                    applied++;
-                }
+            if (re_referenciar()) {
+                buscar(STEPPER_IZQ);
+                cambiar(E3_BARRIDO_IZQ);
+                break;
             }
-        }
+            reportar_error("error de posición (pedido - alcanzado)",
+                           s_pedido - stepper_position(),
+                           stepper_steps_to_cm(s_pedido - stepper_position(), pendiente()));
+            a_idle();
+            break;
 
-        /*
-         * Telemetría. Se informa mientras el motor se mueve y una vez más al
-         * detenerse, que es la intención del sketch original (evitar PUT
-         * inútiles con el motor parado) sin su máquina de estados de conexión.
-         *
-         * La diferencia de fondo está en el valor enviado: aquí es la posición
-         * real del contador de pasos, con resolución de 0,004 cm. El sketch
-         * enviaba una variable que sólo se refrescaba dentro de printPosition()
-         * y sólo tras media vuelta del motor, o sea 0,4 cm: cuatro veces peor
-         * que los 0,1 cm que promete el README (hallazgo A2).
-         */
-        const bool moving = stepper_is_moving();
-        if (moving || was_moving || got) {
-            const stepper_endstops_t now_es = stepper_read_endstops();
-            const kundt_mqtt_sensors_t m = {
-                .plunger_actual   = stepper_steps_to_cm(stepper_position()),
-                .has_plunger_actual = true,
-                .clockwise_limit  = now_es.pos_pressed, .has_clockwise_limit = true,
-                .counter_limit    = now_es.neg_pressed, .has_counter_limit   = true,
-            };
-            if (kundt_mqtt_publish(&m, NULL) != ESP_OK) {
-                pub_failed++;
+        case E3_FALLA:
+            if (ticks % LOG_FALLA_TICKS == 0) {
+                ESP_LOGE(TAG, "FALLA: motor detenido; revisar y reiniciar");
             }
-        }
-        was_moving = moving;
-
-        const int64_t now = esp_timer_get_time() / 1000;
-        if (now - last_stats >= STATS_INTERVAL_MS) {
-            last_stats = now;
-
-            stepper_stats_t st;
-            stepper_get_stats(&st);
-            const stepper_endstops_t es = stepper_read_endstops();
-
-            ESP_LOGI(TAG, "POS  %.2f cm -> %.2f cm  %s  pasos=%llu topes=%lu",
-                     (double)stepper_steps_to_cm(st.position_steps),
-                     (double)stepper_steps_to_cm(st.target_steps),
-                     st.moving ? "en marcha" : "detenido",
-                     (unsigned long long)st.steps_emitted,
-                     (unsigned long)st.endstop_stops);
-            ESP_LOGI(TAG, "RED  consignas=%lu aplicadas=%lu publicados=%lu fallidos=%lu wifi=%s mqtt=%s",
-                     (unsigned long)kundt_mqtt_received(), (unsigned long)applied,
-                     (unsigned long)kundt_mqtt_published(), (unsigned long)pub_failed,
-                     kundt_wifi_ip(),
-                     kundt_mqtt_is_connected() ? "arriba" : "abajo");
-            ESP_LOGI(TAG, "FIN  carrera -: %s   carrera +: %s   calibrado: %s",
-                     es.neg_pressed ? "PULSADO" : "libre",
-                     es.pos_pressed ? "PULSADO" : "libre",
-                     st.calibrated ? "sí" : "NO");
+            break;
         }
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Tubo de Kundt - módulo E3 de motor paso a paso (ESP-IDF)");
+    ESP_LOGI(TAG, "Tubo de Kundt - módulo E3, émbolo motorizado");
 
-    /* Se arranca primero para que el LED dé señales aunque falle la provisión. */
     ESP_ERROR_CHECK(kundt_led_init(KUNDT_LED_DEFAULT_GPIO));
-
-    ESP_ERROR_CHECK(kundt_config_init());
+    ESP_ERROR_CHECK(kundt_config_init()); /* también inicializa NVS */
     kundt_config_log();
 
     if (!kundt_config_is_provisioned()) {
@@ -210,79 +363,17 @@ void app_main(void)
         ESP_LOGE(TAG, "y luego borra NVS una vez con 'idf.py erase-flash' para que carguen.");
         return;
     }
+    ESP_ERROR_CHECK(kundt_config_get(&s_cfg));
 
-    kundt_config_t cfg;
-    ESP_ERROR_CHECK(kundt_config_get(&cfg));
+    const stepper_config_t st = STEPPER_DEFAULT_CONFIG();
+    ESP_ERROR_CHECK(stepper_init(&st, CONFIG_E3_CALIB_SPEED_SPS));
 
-    /* Con MQTT la unidad la fija el DTO de curiousBeagle: plunger_pos va en
-     * centímetros. EMBOLO_UNIT sólo sigue existiendo para las pruebas de host
-     * que ejercitan la conversión del contrato viejo. */
-    ESP_LOGI(TAG, "consignas en centímetros, según el DTO de curiousBeagle");
+    s_cola = xQueueCreate(1, sizeof(kundt_mqtt_actuators_t));
+    configASSERT(s_cola);
 
-    stepper_config_t st_cfg  = STEPPER_DEFAULT_CONFIG();
-    st_cfg.speed_sps         = CONFIG_E3_SPEED_SPS;
-    st_cfg.calib_speed_sps   = CONFIG_E3_CALIB_SPEED_SPS;
-    ESP_ERROR_CHECK(stepper_init(&st_cfg));
-
-#if CONFIG_E3_SELFTEST_ENDSTOP_SIM
-    /* Antes de leer los fines de carrera por primera vez, para que el estado
-     * registrado al arrancar sea el simulado y no el de unos pines al aire. */
-    selftest_endstop_sim_init();
-#endif
-
-    /* Estado de los fines de carrera antes de mover nada: si ambos aparecen
-     * pulsados con el émbolo a media carrera, faltan los pull-ups externos.
-     * GPIO34/35 no tienen pull interno y al aire dan lecturas engañosas. */
-    const stepper_endstops_t es = stepper_read_endstops();
-    ESP_LOGI(TAG, "fines de carrera al arrancar: - %s, + %s",
-             es.neg_pressed ? "PULSADO" : "libre",
-             es.pos_pressed ? "PULSADO" : "libre");
-
-    s_cmd_queue = xQueueCreate(1, sizeof(kundt_mqtt_actuators_t));
-    if (s_cmd_queue == NULL) {
-        ESP_LOGE(TAG, "sin memoria para la cola de consignas");
-        return;
-    }
-
+    /* WiFi sube ya porque la OTA lo necesita; MQTT espera al primer IDLE. */
     ESP_ERROR_CHECK(kundt_wifi_init());
-    ESP_ERROR_CHECK(kundt_wifi_connect(cfg.wifi_ssid, cfg.wifi_password));
+    ESP_ERROR_CHECK(kundt_wifi_connect(s_cfg.wifi_ssid, s_cfg.wifi_password));
 
-    char broker[48];
-    ESP_ERROR_CHECK(kundt_config_broker_uri(broker, sizeof(broker)));
-    ESP_ERROR_CHECK(kundt_mqtt_start(broker, cfg.platform_id, cfg.controller_id,
-                                     on_actuators, NULL));
-
-    kundt_led_set_state(KUNDT_LED_NO_WIFI);
-
-#if CONFIG_E3_SELFTEST
-    kundt_led_mark_selftest();
-    /* Corre antes de la calibración: comprueba el generador de pasos contra el
-     * contador interno del chip y, de paso, que la calibración falle sin
-     * hardware en vez de colgarse. */
-    selftest_run();
-#endif
-
-#if CONFIG_E3_SKIP_CALIBRATION
-    kundt_led_mark_selftest();
-    ESP_LOGW(TAG, "CALIBRACIÓN OMITIDA por configuración: la posición informada");
-    ESP_LOGW(TAG, "no tiene referencia física. Sólo para pruebas de banco.");
-#else
-    /* La calibración no necesita red: se hace apenas el hardware está listo,
-     * para que el riel quede referenciado cuanto antes. */
-    const esp_err_t cal = stepper_calibrate();
-    if (cal != ESP_OK) {
-        ESP_LOGE(TAG, "la calibración falló (%s).", esp_err_to_name(cal));
-        ESP_LOGE(TAG, "El módulo sigue en marcha para poder diagnosticar por red,");
-        ESP_LOGE(TAG, "pero NO moverá el motor: sin referencia, cualquier destino");
-        ESP_LOGE(TAG, "es una orden a ciegas contra los topes del riel.");
-        kundt_led_set_state(KUNDT_LED_NO_SERVER);
-        /* Se deja el módulo vivo pero quieto: informar la posición de un riel
-         * sin referenciar sería peor que no informar nada. */
-        for (;;) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-#endif
-
-    xTaskCreate(control_task, "e3_control", 4096, NULL, 5, NULL);
+    xTaskCreate(fsm_task, "e3_fsm", 4096, NULL, 5, NULL);
 }

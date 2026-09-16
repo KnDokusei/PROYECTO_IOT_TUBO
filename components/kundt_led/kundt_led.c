@@ -13,45 +13,18 @@ static const char *TAG = "kundt_led";
 
 static int               s_gpio  = KUNDT_LED_DEFAULT_GPIO;
 static kundt_led_state_t s_state = KUNDT_LED_BOOT;
-static bool              s_selftest;
 
-static void blink(int on_ms, int off_ms)
-{
-    gpio_set_level(s_gpio, 1);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    gpio_set_level(s_gpio, 0);
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
-}
+#define LED_HALF_PERIOD_MS 500 /* toggle cada 500 ms => 1 Hz */
 
 static void led_task(void *arg)
 {
     (void)arg;
 
+    bool on = false;
     for (;;) {
-        if (s_selftest) {
-            /* Tres parpadeos rápidos antes del patrón normal: esta compilación
-             * no está cableada como espera el esquemático. */
-            blink(60, 60);
-            blink(60, 60);
-            blink(60, 300);
-        }
-
-        switch (s_state) {
-        case KUNDT_LED_BOOT:
-            blink(50, 50);
-            break;
-        case KUNDT_LED_RUNNING:
-            blink(100, 100);
-            break;
-        case KUNDT_LED_NO_SERVER:
-            blink(80, 120);
-            blink(80, 1000);
-            break;
-        case KUNDT_LED_NO_WIFI:
-        default:
-            blink(100, 1900);
-            break;
-        }
+        on = !on;
+        gpio_set_level(s_gpio, on);
+        vTaskDelay(pdMS_TO_TICKS(LED_HALF_PERIOD_MS));
     }
 }
 
@@ -82,7 +55,6 @@ esp_err_t kundt_led_init(int gpio)
 
 void kundt_led_mark_selftest(void)
 {
-    s_selftest = true;
     ESP_LOGW(TAG, "COMPILACIÓN DE AUTOPRUEBA - los pines difieren del "
                   "esquemático, no instalar esto en un equipo");
 }
@@ -103,11 +75,11 @@ kundt_led_state_t kundt_led_get_state(void)
 const char *kundt_led_state_name(kundt_led_state_t state)
 {
     switch (state) {
-    case KUNDT_LED_BOOT:       return "ARRANQUE (titileo rápido)";
-    case KUNDT_LED_NO_WIFI:    return "SIN WIFI (parpadeo lento)";
-    case KUNDT_LED_NO_SERVER:  return "SIN SERVIDOR (parpadeo doble)";
-    case KUNDT_LED_RUNNING:    return "EN MARCHA (parpadeo parejo)";
-    case KUNDT_LED_SELFTEST:   return "AUTOPRUEBA (parpadeo triple)";
+    case KUNDT_LED_BOOT:       return "ARRANQUE";
+    case KUNDT_LED_NO_WIFI:    return "SIN WIFI";
+    case KUNDT_LED_NO_SERVER:  return "SIN SERVIDOR";
+    case KUNDT_LED_RUNNING:    return "EN MARCHA";
+    case KUNDT_LED_SELFTEST:   return "AUTOPRUEBA";
     default:                   return "desconocido";
     }
 }

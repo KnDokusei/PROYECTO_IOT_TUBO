@@ -29,5 +29,9 @@ __pycache__/
 *.pyc
 e1_capture*.wav
 
+# Cachés y telemetría de herramientas de asistencia: son de la máquina de quien
+# programa, no del proyecto, y llevan identificadores de sesión.
+.opencode/
+
 # La documentación de análisis se mantiene sólo en local, fuera de GitHub.
 docs/
