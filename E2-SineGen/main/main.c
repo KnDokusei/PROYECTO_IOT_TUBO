@@ -1,16 +1,35 @@
 /*
- * E2-SineGen - Módulo de generación de audio del tubo de Kundt, port a ESP-IDF.
+ * E2-SineGen - Generación de audio del tubo de Kundt.
  *
- * Función (según el README del proyecto): generar la señal que excita el parlante
- * en un extremo del tubo. La frecuencia la entrega el backend y la sintetiza un
- * DDS AD9833; el volumen también viene del backend y lo fija un servo que gira
- * el potenciómetro a la salida del amplificador de audio.
+ * MQTT manda frecuencia y volumen; el módulo los aplica y confirma lo que quedó
+ * puesto. Nada más: aquí no se mide, sólo se actúa.
  *
- * Cadena de señal: AD9833 (SPI) -> amplificador LM386 -> potenciómetro (servo)
- *                  -> parlante.
+ *   AD9833 (SPI) --> potenciómetro (servo) --> LM358 seguidor --> TPA3118 --> parlante
  *
- * Portado del sketch de Arduino. El comportamiento se conserva a propósito,
- * salvo donde el original estaba mal; esos casos se marcan con su ID de auditoría.
+ * La frecuencia la sintetiza un DDS AD9833 y el volumen es el ángulo de un servo
+ * que gira el potenciómetro de la cadena. "volumen" son GRADOS, de 0 a 180, no
+ * un porcentaje: así lo nombró el firmware original y así lo espera el servidor.
+ *
+ * Una sola tarea, fsm_task, corre la máquina de estados:
+ *
+ *   INIT       -> SIN_WIFI    los periféricos están arriba y ya sale el tono
+ *   SIN_WIFI   -> SIN_BROKER  hay enlace
+ *   SIN_BROKER -> SIN_WIFI    se cayó el enlace
+ *   SIN_BROKER -> IDLE        el broker responde
+ *   IDLE       -> SIN_BROKER  se cayó MQTT; la consigna NO se toca
+ *   IDLE       -> SIN_WIFI    se cayó el WiFi; la consigna NO se toca
+ *   IDLE       -> FALLA       un driver devolvió error al actuar
+ *
+ * Que SIN_WIFI y SIN_BROKER no toquen la consigna es el hallazgo A4: en la
+ * versión Arduino una respuesta mala se convertía en silencio en 0 Hz y 0
+ * grados, así que un tropiezo del backend apagaba el tono y mandaba el servo
+ * contra un extremo. Aquí esos estados existen precisamente para no hacerlo.
+ *
+ * El ritmo lo marca la consigna, no un reloj: xQueueReceive espera hasta
+ * STATUS_INTERVAL_MS, así que una consigna se atiende al instante y, si no
+ * llega ninguna, el vencimiento dispara el latido de estado. E3 usa un tick
+ * fijo porque vigila un motor y dos finales de carrera; aquí no hay nada que
+ * vigilar entre consignas, y un tick fijo sólo añadiría latencia.
  */
 
 #include <stdio.h>
@@ -25,17 +44,12 @@
 #include "kundt_led.h"
 #include "kundt_mqtt.h"
 #include "kundt_wifi.h"
-#include "selftest.h"
 #include "servo.h"
 
 static const char *TAG = "E2-SineGen";
 
-/*
- * Ya no hay sondeo. La versión anterior hacía un GET cada 2 s contra el servidor
- * viejo; con MQTT la consigna llega empujada y se aplica al instante. Este
- * intervalo es sólo el latido con que se reporta el estado, para que el servidor
- * sepa qué está puesto de verdad aunque nadie haya cambiado nada.
- */
+/* Latido de estado: cada cuánto se reporta lo que está puesto aunque nadie haya
+ * cambiado nada. También es el vencimiento de la espera de consignas. */
 #define STATUS_INTERVAL_MS 5000
 
 /* Frecuencia inicial del AD9833; la misma que traía la versión Arduino. */
@@ -50,7 +64,37 @@ static const char *TAG = "E2-SineGen";
 #define FREQ_MIN_HZ 20
 #define FREQ_MAX_HZ 20000
 
+/* Cada cuántas vueltas se recuerda que el módulo está en falla. */
+#define FALLA_CADA 12  /* 12 x 5 s = 1 min */
+
+typedef enum {
+    E2_INIT,
+    E2_SIN_WIFI,
+    E2_SIN_BROKER,
+    E2_IDLE,
+    E2_FALLA,
+} estado_t;
+
+static const char *const NOMBRE[] = {
+    [E2_INIT]       = "INIT",
+    [E2_SIN_WIFI]   = "SIN_WIFI",
+    [E2_SIN_BROKER] = "SIN_BROKER",
+    [E2_IDLE]       = "IDLE",
+    [E2_FALLA]      = "FALLA",
+};
+
+static estado_t        s_estado = E2_INIT;
 static ad9833_handle_t s_dds;
+static int             s_freq_hz = DEFAULT_FREQ_HZ; /* lo que el DDS tiene puesto */
+static QueueHandle_t   s_cola;
+
+/* --------------------------------------------------------------------- */
+
+static void cambiar(estado_t nuevo)
+{
+    ESP_LOGI(TAG, "%s -> %s", NOMBRE[s_estado], NOMBRE[nuevo]);
+    s_estado = nuevo;
+}
 
 static int clamp_freq(int hz)
 {
@@ -64,26 +108,35 @@ static int clamp_freq(int hz)
 }
 
 /*
- * Cola de una sola entrada, sobrescribible. El callback de MQTT corre en la
- * tarea de eventos del cliente y no debe bloquear, así que sólo deja aquí la
- * última consigna; aplicarla es cosa de la tarea de control.
+ * Cola de una sola entrada, sobrescribible. El callback corre en la tarea de
+ * eventos del cliente MQTT y no debe bloquear, así que sólo deja aquí la última
+ * consigna; aplicarla es cosa de la FSM.
  *
  * Se sobrescribe a propósito: si llegan tres consignas mientras la tarea está
  * ocupada, la que importa es la última. Encolarlas todas haría que el generador
  * recorriera frecuencias que nadie pidió.
  */
-static QueueHandle_t s_cmd_queue;
-
 static void on_actuators(const kundt_mqtt_actuators_t *act, void *ctx)
 {
     (void)ctx;
-    xQueueOverwrite(s_cmd_queue, act);
+    xQueueOverwrite(s_cola, act);
 }
 
-/* Aplica una consigna. Devuelve true si cambió algo. */
-static bool apply_actuators(const kundt_mqtt_actuators_t *a, int *last_freq)
+/* Publica lo que está puesto de verdad, no lo que se pidió: si el servo no
+ * llegó al ángulo o la frecuencia se acotó, el servidor debe ver el valor real. */
+static void publicar(void)
 {
-    bool changed = false;
+    const kundt_mqtt_actuators_t estado = {
+        .frequency     = s_freq_hz,         .has_frequency = true,
+        .volume        = servo_get_angle(), .has_volume    = true,
+    };
+    kundt_mqtt_publish(NULL, &estado);
+}
+
+/* Aplica una consigna. Devuelve false si un driver falló al actuar. */
+static bool aplicar(const kundt_mqtt_actuators_t *a)
+{
+    bool ok = true;
 
     if (a->has_frequency) {
         const int want = clamp_freq((int)a->frequency);
@@ -93,13 +146,24 @@ static bool apply_actuators(const kundt_mqtt_actuators_t *a, int *last_freq)
         }
         /* Reprogramar sólo si cambió: el original reescribía el DDS en cada
          * ciclo aunque el valor fuera idéntico. */
-        if (want != *last_freq) {
+        if (want != s_freq_hz) {
             uint32_t actual = 0;
-            if (ad9833_set_frequency(s_dds, (uint32_t)want, &actual) == ESP_OK) {
-                *last_freq = want;
-                changed = true;
+            const esp_err_t err = ad9833_set_frequency(s_dds, (uint32_t)want, &actual);
+            if (err == ESP_OK) {
+                s_freq_hz = want;
                 ESP_LOGI(TAG, "frecuencia -> %d Hz (el DDS sintetiza %lu Hz)",
                          want, (unsigned long)actual);
+            } else {
+                /*
+                 * El AD9833 es de sólo escritura y la palabra de frecuencia sale
+                 * en tres transferencias: un fallo a mitad deja FREQ0 con una
+                 * mitad nueva y otra vieja, o sea el chip emitiendo algo que
+                 * nadie pidió. Antes esto no se registraba y el módulo seguía
+                 * publicando la frecuencia anterior como si nada.
+                 */
+                ESP_LOGE(TAG, "el DDS rechazó %d Hz (%s); la salida del chip es incierta",
+                         want, esp_err_to_name(err));
+                ok = false;
             }
         }
     }
@@ -107,69 +171,97 @@ static bool apply_actuators(const kundt_mqtt_actuators_t *a, int *last_freq)
     if (a->has_volume) {
         /* "volumen" es un ángulo de servo en grados, no un porcentaje (M1). */
         if ((int)a->volume != servo_get_angle()) {
-            if (servo_set_angle((int)a->volume) == ESP_OK) {
-                changed = true;
+            const esp_err_t err = servo_set_angle((int)a->volume);
+            if (err == ESP_OK) {
                 ESP_LOGI(TAG, "volumen -> %d grados", servo_get_angle());
+            } else {
+                ESP_LOGE(TAG, "el servo rechazó %ld grados (%s)",
+                         (long)a->volume, esp_err_to_name(err));
+                ok = false;
             }
         }
     }
 
-    return changed;
+    return ok;
 }
 
-static void control_task(void *arg)
+/* --------------------------------------------------------------------- */
+
+static void fsm_task(void *arg)
 {
     (void)arg;
+    kundt_mqtt_actuators_t cmd;
+    uint32_t vueltas = 0;
 
-    int      last_freq = DEFAULT_FREQ_HZ;
-    uint32_t applied = 0;
-
-    ESP_LOGI(TAG, "lazo de control iniciado (estado cada %d ms)", STATUS_INTERVAL_MS);
+    ESP_LOGI(TAG, "lazo de control iniciado (latido cada %d ms)", STATUS_INTERVAL_MS);
 
     for (;;) {
-        kundt_mqtt_actuators_t cmd;
-
-        /* Se espera con tiempo límite en vez de dormir: una consigna se atiende
-         * al instante, y si no llega ninguna el vencimiento dispara el reporte
-         * periódico de estado. */
-        const bool got = xQueueReceive(s_cmd_queue, &cmd,
+        /* El vencimiento ES el tick: una consigna se atiende al instante, y si
+         * no llega ninguna dispara el latido. */
+        const bool hay = xQueueReceive(s_cola, &cmd,
                                        pdMS_TO_TICKS(STATUS_INTERVAL_MS)) == pdTRUE;
+        vueltas++;
 
-        if (!kundt_wifi_is_connected()) {
+        switch (s_estado) {
+        case E2_INIT:
+            /* app_main dejó el DDS emitiendo y el servo en su ángulo inicial. */
+            cambiar(E2_SIN_WIFI);
+            break;
+
+        case E2_SIN_WIFI:
             kundt_led_set_state(KUNDT_LED_NO_WIFI);
-            continue;  /* El componente de WiFi reintenta por su cuenta. */
-        }
-        if (!kundt_mqtt_is_connected()) {
+            if (kundt_wifi_is_connected()) {
+                cambiar(E2_SIN_BROKER);
+            }
+            break;
+
+        case E2_SIN_BROKER:
             kundt_led_set_state(KUNDT_LED_NO_SERVER);
+            if (!kundt_wifi_is_connected()) {
+                cambiar(E2_SIN_WIFI);
+            } else if (kundt_mqtt_is_connected()) {
+                cambiar(E2_IDLE);
+            }
+            break;
+
+        case E2_IDLE:
+            if (!kundt_wifi_is_connected()) {
+                cambiar(E2_SIN_WIFI);
+                break;
+            }
+            if (!kundt_mqtt_is_connected()) {
+                cambiar(E2_SIN_BROKER);
+                break;
+            }
+            kundt_led_set_state(KUNDT_LED_RUNNING);
+
+            if (hay && !aplicar(&cmd)) {
+                cambiar(E2_FALLA);
+                break;
+            }
+            publicar();
+
+            if ((kundt_mqtt_published() % 60) == 0) {
+                ESP_LOGI(TAG, "consignas=%lu publicados=%lu | %d Hz, %d grados | wifi=%s",
+                         (unsigned long)kundt_mqtt_received(),
+                         (unsigned long)kundt_mqtt_published(),
+                         s_freq_hz, servo_get_angle(), kundt_wifi_ip());
+            }
+            break;
+
+        case E2_FALLA:
             /*
-             * Mantener la última consigna en vez de caer a cero. En la versión
-             * Arduino una respuesta mala se convertía en silencio en 0 Hz y 0
-             * grados, así que un tropiezo del backend apagaba el tono y mandaba
-             * el servo contra un extremo (hallazgo A4).
+             * Se sigue publicando a propósito. Si el módulo callara, el servidor
+             * no podría distinguir una avería de una placa desenchufada, y lo
+             * que se publica aquí es justamente lo último que se sabe cierto.
              */
-            continue;
-        }
-
-        kundt_led_set_state(KUNDT_LED_RUNNING);
-
-        if (got) {
-            applied += apply_actuators(&cmd, &last_freq) ? 1 : 0;
-        }
-
-        /* Se reporta lo que está puesto de verdad, no lo que se pidió: si el
-         * servo no llegó al ángulo o el DDS acotó la frecuencia, el servidor
-         * debe ver el valor real. */
-        const kundt_mqtt_actuators_t state = {
-            .frequency     = last_freq,        .has_frequency = true,
-            .volume        = servo_get_angle(), .has_volume   = true,
-        };
-        kundt_mqtt_publish(NULL, &state);
-
-        if ((kundt_mqtt_published() % 60) == 0) {
-            ESP_LOGI(TAG, "consignas=%lu aplicadas=%lu publicados=%lu | %d Hz, %d grados | wifi=%s",
-                     (unsigned long)kundt_mqtt_received(), (unsigned long)applied,
-                     (unsigned long)kundt_mqtt_published(),
-                     last_freq, servo_get_angle(), kundt_wifi_ip());
+            if (kundt_mqtt_is_connected()) {
+                publicar();
+            }
+            if ((vueltas % FALLA_CADA) == 0) {
+                ESP_LOGE(TAG, "FALLA: un driver rechazó la última consigna; revisar SPI y servo");
+            }
+            break;
         }
     }
 }
@@ -205,35 +297,13 @@ void app_main(void)
     ESP_LOGI(TAG, "tono por defecto: %d Hz pedidos, %lu Hz sintetizados",
              DEFAULT_FREQ_HZ, (unsigned long)actual);
 
-#if CONFIG_E2_SELFTEST
-    kundt_led_mark_selftest();
-
-    /* Corre antes de servo_init(): LEDC se apropia del pin y esta comprobación
-     * necesita manejarlo como GPIO común. */
-    selftest_check_jumper();
-#endif
-
-    servo_config_t servo_cfg = SERVO_DEFAULT_CONFIG();
-#if CONFIG_E2_SELFTEST
-    /* Llevar el PWM al pin puenteado con el ADC, para medir el mapeo sin tener
-     * un servo conectado. */
-    servo_cfg.gpio = CONFIG_E2_SELFTEST_SERVO_GPIO;
-#endif
+    const servo_config_t servo_cfg = SERVO_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(servo_init(&servo_cfg));
 
-#if CONFIG_E2_SELFTEST
-    if (selftest_init() == ESP_OK) {
-        /* Que falle la comprobación del puente no detiene el barrido: ver las
-         * lecturas junto al veredicto informa más que omitirlas. */
-        selftest_run_servo_sweep();
-    }
-#endif
-
-    s_cmd_queue = xQueueCreate(1, sizeof(kundt_mqtt_actuators_t));
-    if (s_cmd_queue == NULL) {
-        ESP_LOGE(TAG, "sin memoria para la cola de consignas");
-        return;
-    }
+    /* La cola se crea antes de arrancar MQTT: si no, el primer mensaje entrante
+     * la encontraría en NULL. */
+    s_cola = xQueueCreate(1, sizeof(kundt_mqtt_actuators_t));
+    configASSERT(s_cola);
 
     ESP_ERROR_CHECK(kundt_wifi_init());
     ESP_ERROR_CHECK(kundt_wifi_connect(cfg.wifi_ssid, cfg.wifi_password));
@@ -247,5 +317,5 @@ void app_main(void)
                                      on_actuators, NULL));
 
     kundt_led_set_state(KUNDT_LED_NO_WIFI);
-    xTaskCreate(control_task, "e2_control", 4096, NULL, 5, NULL);
+    xTaskCreate(fsm_task, "e2_fsm", 4096, NULL, 5, NULL);
 }
