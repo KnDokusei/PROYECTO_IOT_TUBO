@@ -1,0 +1,8 @@
+dependencies:
+  idf:
+    version: ">=5.0"
+  # Driver oficial del OV2640. Sustituye al esp_camera.h que el core de Arduino
+  # traía dentro: es el mismo código de Espressif, servido por el gestor de
+  # componentes en vez de venir escondido en el core.
+  espressif/esp32-camera:
+    version: "^2.0.4"

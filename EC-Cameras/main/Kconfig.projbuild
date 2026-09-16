@@ -1,0 +1,36 @@
+menu "EC-Cameras module"
+
+    choice EC_FRAMESIZE
+        prompt "Frame size"
+        default EC_FRAMESIZE_XGA
+        help
+            XGA matches the Arduino sketch this module replaces. Dropping to
+            SVGA or VGA is the cheapest way to cut bandwidth: three cameras at
+            XGA share the same 2.4 GHz band as the measurement modules.
+
+        config EC_FRAMESIZE_VGA
+            bool "VGA 640x480"
+        config EC_FRAMESIZE_SVGA
+            bool "SVGA 800x600"
+        config EC_FRAMESIZE_XGA
+            bool "XGA 1024x768"
+    endchoice
+
+    config EC_JPEG_QUALITY
+        int "JPEG quality (0 best, 63 worst)"
+        range 0 63
+        default 12
+        help
+            The sketch used 10. Slightly lower quality costs little visually and
+            takes a noticeable bite out of the frame size.
+
+    config EC_MAX_FPS
+        int "Frame rate cap, 0 disables it"
+        range 0 30
+        default 10
+        help
+            The sketch streamed as fast as the sensor produced frames. At XGA
+            that is several Mbit/s per camera with nobody watching the total.
+            Capping is one vTaskDelay and makes the load predictable.
+
+endmenu
